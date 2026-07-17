@@ -50,7 +50,9 @@ import argparse
 import csv
 import json
 import math
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -59,23 +61,53 @@ import time
 
 class Engine:
     """Thin UCI wrapper: non-blocking line reader via a background thread,
-    so a hung/slow engine can never freeze the whole harness (subprocess
-    pipes are notoriously not select()-able on Windows, hence the thread)."""
+    so a hung/slow engine can never freeze the harness (subprocess pipes are
+    notoriously not select()-able on Windows, hence the thread).
 
-    def __init__(self, path, options=None):
+    IMPORTANT (fixed after a real bug found in production): stderr used to be
+    silently discarded (subprocess.DEVNULL), which meant a genuine engine
+    crash gave NO diagnostic information at all -- and every game after the
+    crash silently failed with "Broken pipe" and got miscounted as a draw,
+    corrupting the whole match's score. Both are fixed now: stderr goes to a
+    real log file, and the engine process is restarted if it dies."""
+
+    def __init__(self, path, options=None, tag="engine"):
         self.path = path
+        self.options = options or {}
+        safe_tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+        self.stderr_path = f"{safe_tag}_stderr.log"
+        self._start_process()
+
+    def _start_process(self):
+        # Open in append mode so restarts don't erase earlier crash evidence.
+        self._stderr_file = open(self.stderr_path, "a")
         self.proc = subprocess.Popen(
-            [path],
+            [self.path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             text=True,
             bufsize=1,
         )
         self.q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        self._handshake(options or {})
+        self._handshake(self.options)
+
+    def is_alive(self):
+        return self.proc.poll() is None
+
+    def ensure_alive(self):
+        """Restart the engine process if it died since the last game. Returns
+        True if a restart happened (so the caller can log it)."""
+        if self.is_alive():
+            return False
+        try:
+            self._stderr_file.close()
+        except Exception:
+            pass
+        self._start_process()
+        return True
 
     def _read_loop(self):
         for line in self.proc.stdout:
@@ -92,7 +124,8 @@ class Engine:
         except queue.Empty:
             raise TimeoutError(f"{self.path}: no response within {timeout}s")
         if line is None:
-            raise ConnectionError(f"{self.path}: engine process exited unexpectedly")
+            raise ConnectionError(f"{self.path}: engine process exited unexpectedly "
+                                   f"(see {self.stderr_path} for its stderr output)")
         return line
 
     def wait_for(self, token, timeout=30.0):
@@ -136,6 +169,10 @@ class Engine:
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+        try:
+            self._stderr_file.close()
+        except Exception:
+            pass
 
 
 def parse_options(spec):
@@ -211,12 +248,18 @@ def main():
     e2_opts = parse_options(args.e2_options)
 
     print(f"Starting engine1 ({args.engine1}) ...")
-    e1 = Engine(args.engine1, e1_opts)
+    e1 = Engine(args.engine1, e1_opts, tag="engine1")
     print(f"Starting engine2 ({args.engine2}) ...")
-    e2 = Engine(args.engine2, e2_opts)
+    e2 = Engine(args.engine2, e2_opts, tag="engine2")
 
     # score is always tracked from engine2's ("patched") point of view.
-    e2_wins = e2_losses = draws = 0
+    # aborted (crash/timeout) games are NOT draws -- a game we never actually
+    # finished tells us nothing about relative strength, and silently
+    # counting it as a draw was a real bug: it drags every score toward 50%
+    # regardless of true strength difference. Aborted games are excluded from
+    # score and reported separately instead.
+    e2_wins = e2_losses = draws = aborted = 0
+    consecutive_aborts = 0
     rows = []
 
     try:
@@ -224,25 +267,48 @@ def main():
             e2_is_red = (g % 2 == 0)  # alternate who opens each game
             red, black = (e2, e1) if e2_is_red else (e1, e2)
 
+            for eng, name in ((red, "red"), (black, "black")):
+                if eng.ensure_alive():
+                    print(f"[game {g}] {name} engine ({eng.path}) had died -- restarted "
+                          f"(see {eng.stderr_path} for why it crashed)")
+
             t0 = time.time()
+            aborted_this_game = False
             try:
                 result, plies, reason = play_game(red, black, args.movetime, args.max_plies, args.move_timeout)
             except (TimeoutError, ConnectionError) as exc:
                 print(f"[game {g}] ABORTED: {exc}")
-                result, plies, reason = "draw", 0, f"aborted:{exc}"
+                result, plies, reason = "aborted", 0, f"aborted:{exc}"
+                aborted_this_game = True
             dt = time.time() - t0
 
-            if result == "draw":
-                draws += 1
-                e2_result = "draw"
+            if aborted_this_game:
+                aborted += 1
+                consecutive_aborts += 1
+                e2_result = "aborted"
+                if consecutive_aborts >= 3:
+                    print(f"\n[DỪNG SỚM] {consecutive_aborts} ván liên tiếp bị abort -- "
+                          f"engine đang crash lặp lại, không phải sự cố ngẫu nhiên. "
+                          f"Kiểm tra engine1_stderr.log / engine2_stderr.log để biết lý do thật.")
+                    rows.append({
+                        "game": g, "e2_color": "red" if e2_is_red else "black",
+                        "result": result, "e2_result": e2_result,
+                        "plies": plies, "reason": reason, "seconds": round(dt, 1),
+                    })
+                    break
             else:
-                e2_won = (result == "red" and e2_is_red) or (result == "black" and not e2_is_red)
-                if e2_won:
-                    e2_wins += 1
-                    e2_result = "win"
+                consecutive_aborts = 0
+                if result == "draw":
+                    draws += 1
+                    e2_result = "draw"
                 else:
-                    e2_losses += 1
-                    e2_result = "loss"
+                    e2_won = (result == "red" and e2_is_red) or (result == "black" and not e2_is_red)
+                    if e2_won:
+                        e2_wins += 1
+                        e2_result = "win"
+                    else:
+                        e2_losses += 1
+                        e2_result = "loss"
 
             rows.append({
                 "game": g, "e2_color": "red" if e2_is_red else "black",
@@ -250,10 +316,10 @@ def main():
                 "plies": plies, "reason": reason, "seconds": round(dt, 1),
             })
 
-            played = g + 1
-            score = (e2_wins + 0.5 * draws) / played
-            print(f"[{played}/{args.games}] e2={e2_result:5s} ({reason}, {plies}p, {dt:.0f}s) "
-                  f"| tổng: W{e2_wins} D{draws} L{e2_losses}  score={score:.3f}")
+            played = e2_wins + draws + e2_losses
+            score = (e2_wins + 0.5 * draws) / played if played else float("nan")
+            print(f"[{g + 1}/{args.games}] e2={e2_result:8s} ({reason}, {plies}p, {dt:.0f}s) "
+                  f"| hoàn tất: W{e2_wins} D{draws} L{e2_losses}  aborted={aborted}  score={score:.3f}")
     finally:
         e1.quit()
         e2.quit()
@@ -266,10 +332,11 @@ def main():
 
     played = e2_wins + draws + e2_losses
     if played == 0:
-        print("Không có ván nào hoàn thành.")
+        print(f"Không có ván nào hoàn thành ({aborted} ván bị abort). "
+              f"Xem engine1_stderr.log / engine2_stderr.log để biết engine crash vì sao.")
         if args.summary_json:
             with open(args.summary_json, "w") as jf:
-                json.dump({"played": 0, "wins": 0, "draws": 0, "losses": 0,
+                json.dump({"played": 0, "wins": 0, "draws": 0, "losses": 0, "aborted": aborted,
                            "score": None, "elo_diff": None}, jf, indent=2)
         sys.exit(1)
 
@@ -277,9 +344,13 @@ def main():
     elo_diff = 400 * math.log10(score / (1 - score)) if 0 < score < 1 else None
 
     print("\n=== KẾT QUẢ CUỐI (engine2 = bản patched) ===")
-    print(f"Ván đã chơi : {played}")
+    print(f"Ván hoàn tất: {played}   |   Ván bị abort (crash/timeout, KHÔNG tính vào score): {aborted}")
     print(f"Thắng/Hòa/Thua (engine2): {e2_wins}/{draws}/{e2_losses}")
     print(f"Score       : {score:.1%}")
+    if aborted > 0:
+        print(f"\n!! CẢNH BÁO: {aborted} ván bị abort -- xem engine1_stderr.log / "
+              f"engine2_stderr.log để biết engine nào crash và vì sao. Score ở trên "
+              f"chỉ tính trên {played} ván THẬT SỰ chơi xong, không bị pha loãng bởi ván crash.")
     if elo_diff is not None:
         print(f"Chênh Elo ước lượng (engine2 - engine1): {elo_diff:+.0f}")
     elif score >= 1:
@@ -292,7 +363,7 @@ def main():
     if args.summary_json:
         with open(args.summary_json, "w") as jf:
             json.dump({"played": played, "wins": e2_wins, "draws": draws, "losses": e2_losses,
-                       "score": score, "elo_diff": elo_diff}, jf, indent=2)
+                       "aborted": aborted, "score": score, "elo_diff": elo_diff}, jf, indent=2)
 
     if args.min_score is not None and score < args.min_score:
         print(f"\n[CI GATE] score {score:.3f} < --min-score {args.min_score:.3f} -> exit 1")
