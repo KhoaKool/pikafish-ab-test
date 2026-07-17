@@ -24,16 +24,20 @@ on:
         default: "0.45"
 
 env:
-  # GitHub-hosted runner không đảm bảo CPU hỗ trợ BMI2 -- dùng AVX2, chính
-  # Makefile của Pikafish khuyến nghị đây là lựa chọn portable nhất
-  # ("A portable compile for most x86-64 systems").
-  PIKAFISH_ARCH: x86-64-avx2
+  # Dùng đúng công thức build mà chính CI của official-pikafish/Pikafish đã
+  # xác nhận chạy được trên GitHub-hosted runner (.github/workflows/pikafish.yml
+  # trong repo gốc) -- KHÔNG dùng ARCH=avx2 + COMP=gcc + profile-build như bản
+  # nháp trước (bản đó chưa ai xác nhận chạy được trên CI, và profile-build
+  # tốn CPU/RAM hơn hẳn 'build' thường vì phải build 2 lần (PGO): 1 lần bản
+  # instrumented, chạy benchmark lấy profile, rồi build lại lần 2).
+  PIKAFISH_ARCH: x86-64-universal
+  PIKAFISH_COMP: clang
   BASE_COMMIT: 8ab92480b3b270bb7271910585acd4cc148da80b
   PIKAFISH_REPO: https://github.com/official-pikafish/Pikafish.git
 
 jobs:
   ab-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 340
     steps:
       - name: Checkout this repo (patch file + scripts)
@@ -43,6 +47,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+
+      - name: Set up clang/libc++ (same recipe official Pikafish CI uses)
+        run: |
+          LLVM_VERSION=17
+          curl -s https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_VERSION
+          sudo apt-get install -y libc++-$LLVM_VERSION-dev libc++abi-$LLVM_VERSION-dev libunwind-$LLVM_VERSION-dev
+          echo "EXTRACXXFLAGS=-stdlib=libc++" >> "$GITHUB_ENV"
+          echo "EXTRALDFLAGS=-stdlib=libc++" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: Clone baseline Pikafish
         run: |
@@ -61,10 +74,10 @@ jobs:
           git -C patched apply "$PATCH_ABS"
 
       - name: Build baseline
-        run: make -C base/src -j"$(nproc)" profile-build ARCH="$PIKAFISH_ARCH" COMP=gcc
+        run: make -C base/src -j4 build ARCH="$PIKAFISH_ARCH" COMP="$PIKAFISH_COMP"
 
       - name: Build patched
-        run: make -C patched/src -j"$(nproc)" profile-build ARCH="$PIKAFISH_ARCH" COMP=gcc
+        run: make -C patched/src -j4 build ARCH="$PIKAFISH_ARCH" COMP="$PIKAFISH_COMP"
 
       - name: Smoke test both binaries respond to UCI
         run: |
