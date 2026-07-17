@@ -56,8 +56,9 @@ jobs:
 
       - name: Apply patch (fail fast if it doesn't apply cleanly)
         run: |
-          git -C patched apply --check "${{ github.event.inputs.patch_file }}"
-          git -C patched apply "${{ github.event.inputs.patch_file }}"
+          PATCH_ABS="$GITHUB_WORKSPACE/${{ github.event.inputs.patch_file }}"
+          git -C patched apply --check "$PATCH_ABS"
+          git -C patched apply "$PATCH_ABS"
 
       - name: Build baseline
         run: make -C base/src -j"$(nproc)" profile-build ARCH="$PIKAFISH_ARCH" COMP=gcc
