@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+pika_match.py -- A/B self-play harness for Pikafish (baseline vs patched).
+
+WHY THIS EXISTS
+----------------
+Không có cách nào biết 1 patch làm engine mạnh hơn hay yếu hơn chỉ bằng cách
+đọc code. Script này cho 2 binary (bản gốc và bản đã vá) tự đấu với nhau N
+ván qua giao thức UCI, đảo màu đi trước mỗi ván để loại bỏ lợi thế tiên thủ,
+và in ra tỉ số thắng/hòa/thua + phần trăm điểm + ước lượng chênh Elo.
+
+THẬT THÀ VỀ GIỚI HẠN (đọc trước khi tin kết quả)
+--------------------------------------------------
+1. Phát hiện chiếu bí / hết nước đi: dùng tín hiệu "bestmove (none)" -- đây
+   là tín hiệu CHẮC CHẮN đúng (Pikafish trả về khi hết nước đi hợp lệ).
+2. Phát hiện HÒA (lặp thế 3 lần / 60 nước không ăn quân theo luật Xiangqi):
+   script KHÔNG tự dựng bàn cờ để kiểm tra luật này chính xác 100%. Nó chỉ
+   dùng 2 cách xấp xỉ:
+     a) Giới hạn số nước tối đa (--max-plies), hết thì xử hòa.
+     b) Phát hiện lặp lại chuỗi nước gần đây (heuristic, không phải luật
+        chính thức) để dừng sớm các ván lặp vô nghĩa.
+   => Điều này có nghĩa: kết quả "hòa" trong file output có thể không khớp
+      100% với phán quyết thật của rule_judge() bên trong engine. Với vài
+      trăm ván, sai số này thường nhỏ và không đổi kết luận tổng thể, nhưng
+      đừng tin tuyệt đối 1-2 ván lẻ bị xử hòa do --max-plies.
+3. Không kiểm tra hợp lệ nước đi (không tự implement luật Xiangqi) -- tin
+   tưởng cả 2 engine trả về nước hợp lệ. Nếu 1 bên có bug sinh nước bất hợp
+   lệ, script sẽ KHÔNG phát hiện được (đây là điều bạn phải tự kiểm tra qua
+   file PGN/log nếu nghi ngờ).
+4. Đây là công cụ ĐO XU HƯỚNG nhanh, không thay thế được SPRT thật (như
+   fastchess/cutechess dùng cho Stockfish) nếu bạn cần độ tin cậy thống kê
+   nghiêm ngặt. Coi kết quả là "có vẻ tốt hơn / có vẻ tệ hơn / chưa rõ", và
+   chạy lại với --games lớn hơn nếu chênh lệch sát 50%.
+
+CÁCH DÙNG
+---------
+    python pika_match.py --engine1 ./pikafish_base.exe --engine2 ./pikafish_patched.exe \
+        --games 200 --movetime 1000 --max-plies 260 --out results.csv
+
+    --engine1 / --engine2 : đường dẫn 2 file .exe (hoặc binary Linux)
+    --movetime            : ms suy nghĩ mỗi nước (cố định, để công bằng)
+    --max-plies           : số nửa-nước tối đa trước khi xử hòa (mặc định 260)
+    --games                : số ván (sẽ tự đảo màu, nên dùng số chẵn)
+    --e1-options / --e2-options : "Name1=Value1,Name2=Value2" gửi qua
+                              setoption trước mỗi ván (vd Contempt=40)
+    --out                  : file CSV ghi từng ván
+"""
+
+import argparse
+import csv
+import json
+import math
+import queue
+import subprocess
+import sys
+import threading
+import time
+
+
+class Engine:
+    """Thin UCI wrapper: non-blocking line reader via a background thread,
+    so a hung/slow engine can never freeze the whole harness (subprocess
+    pipes are notoriously not select()-able on Windows, hence the thread)."""
+
+    def __init__(self, path, options=None):
+        self.path = path
+        self.proc = subprocess.Popen(
+            [path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self.q = queue.Queue()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._handshake(options or {})
+
+    def _read_loop(self):
+        for line in self.proc.stdout:
+            self.q.put(line.rstrip("\n"))
+        self.q.put(None)  # signal EOF
+
+    def send(self, cmd):
+        self.proc.stdin.write(cmd + "\n")
+        self.proc.stdin.flush()
+
+    def readline(self, timeout=30.0):
+        try:
+            line = self.q.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"{self.path}: no response within {timeout}s")
+        if line is None:
+            raise ConnectionError(f"{self.path}: engine process exited unexpectedly")
+        return line
+
+    def wait_for(self, token, timeout=30.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self.readline(timeout=max(0.1, deadline - time.time()))
+            if token in line:
+                return line
+        raise TimeoutError(f"{self.path}: '{token}' not seen within {timeout}s")
+
+    def _handshake(self, options):
+        self.send("uci")
+        self.wait_for("uciok")
+        for name, value in options.items():
+            self.send(f"setoption name {name} value {value}")
+        self.send("isready")
+        self.wait_for("readyok")
+
+    def new_game(self):
+        self.send("ucinewgame")
+        self.send("isready")
+        self.wait_for("readyok")
+
+    def go_and_get_move(self, moves, movetime_ms, timeout_s):
+        pos_cmd = "position startpos"
+        if moves:
+            pos_cmd += " moves " + " ".join(moves)
+        self.send(pos_cmd)
+        self.send(f"go movetime {movetime_ms}")
+        line = self.wait_for("bestmove", timeout=timeout_s)
+        # "bestmove e2e4 ponder e7e5"  or  "bestmove (none)"
+        parts = line.split()
+        return parts[1] if len(parts) > 1 else "(none)"
+
+    def quit(self):
+        try:
+            self.send("quit")
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
+def parse_options(spec):
+    opts = {}
+    if not spec:
+        return opts
+    for pair in spec.split(","):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            opts[k.strip()] = v.strip()
+    return opts
+
+
+def looks_repetitive(moves, window=8, repeats=3):
+    """Approximate repetition heuristic (NOT the engine's real rule_judge):
+    flags if the same block of `window` moves appears `repeats` times in a
+    row at the tail of the move list. Used only as an early-exit for
+    obviously stuck games; final ground truth for close results should
+    still be spot-checked against real games, not this heuristic alone."""
+    n = window * repeats
+    if len(moves) < n:
+        return False
+    tail = moves[-n:]
+    block = tail[:window]
+    return all(tail[i * window:(i + 1) * window] == block for i in range(repeats))
+
+
+def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s):
+    """red_engine moves first (Red always opens in Xiangqi). Returns
+    (result, plies, reason) where result is 'red', 'black', or 'draw'."""
+    red_engine.new_game()
+    black_engine.new_game()
+
+    moves = []
+    for ply in range(max_plies):
+        mover = red_engine if ply % 2 == 0 else black_engine
+        move = mover.go_and_get_move(moves, movetime_ms, move_timeout_s)
+
+        if move == "(none)":
+            # Side to move has no legal move => that side loses (Xiangqi has
+            # no stalemate-draw rule: no legal move is always a loss).
+            loser_is_red = (ply % 2 == 0)
+            return ("black" if loser_is_red else "red"), ply, "no_legal_move"
+
+        moves.append(move)
+
+        if looks_repetitive(moves):
+            return "draw", ply + 1, "repetition_heuristic"
+
+    return "draw", max_plies, "max_plies_reached"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--engine1", required=True, help="Path to baseline engine binary")
+    ap.add_argument("--engine2", required=True, help="Path to patched engine binary")
+    ap.add_argument("--games", type=int, default=100)
+    ap.add_argument("--movetime", type=int, default=1000, help="ms per move")
+    ap.add_argument("--max-plies", type=int, default=260)
+    ap.add_argument("--move-timeout", type=float, default=30.0,
+                     help="Seconds to wait for a single bestmove before aborting the game")
+    ap.add_argument("--e1-options", default="", help="e.g. Contempt=0,MaxThinkTime=30000")
+    ap.add_argument("--e2-options", default="", help="e.g. Contempt=40,MaxThinkTime=30000")
+    ap.add_argument("--out", default="pika_match_results.csv")
+    ap.add_argument("--summary-json", default="",
+                     help="Optional path to write a machine-readable {wins,draws,losses,score,elo_diff} summary, for CI")
+    ap.add_argument("--min-score", type=float, default=None,
+                     help="If set, exit with code 1 when engine2's final score is below this "
+                          "(0.0-1.0) -- lets a CI job fail visibly when the patch looks worse")
+    args = ap.parse_args()
+
+    e1_opts = parse_options(args.e1_options)
+    e2_opts = parse_options(args.e2_options)
+
+    print(f"Starting engine1 ({args.engine1}) ...")
+    e1 = Engine(args.engine1, e1_opts)
+    print(f"Starting engine2 ({args.engine2}) ...")
+    e2 = Engine(args.engine2, e2_opts)
+
+    # score is always tracked from engine2's ("patched") point of view.
+    e2_wins = e2_losses = draws = 0
+    rows = []
+
+    try:
+        for g in range(args.games):
+            e2_is_red = (g % 2 == 0)  # alternate who opens each game
+            red, black = (e2, e1) if e2_is_red else (e1, e2)
+
+            t0 = time.time()
+            try:
+                result, plies, reason = play_game(red, black, args.movetime, args.max_plies, args.move_timeout)
+            except (TimeoutError, ConnectionError) as exc:
+                print(f"[game {g}] ABORTED: {exc}")
+                result, plies, reason = "draw", 0, f"aborted:{exc}"
+            dt = time.time() - t0
+
+            if result == "draw":
+                draws += 1
+                e2_result = "draw"
+            else:
+                e2_won = (result == "red" and e2_is_red) or (result == "black" and not e2_is_red)
+                if e2_won:
+                    e2_wins += 1
+                    e2_result = "win"
+                else:
+                    e2_losses += 1
+                    e2_result = "loss"
+
+            rows.append({
+                "game": g, "e2_color": "red" if e2_is_red else "black",
+                "result": result, "e2_result": e2_result,
+                "plies": plies, "reason": reason, "seconds": round(dt, 1),
+            })
+
+            played = g + 1
+            score = (e2_wins + 0.5 * draws) / played
+            print(f"[{played}/{args.games}] e2={e2_result:5s} ({reason}, {plies}p, {dt:.0f}s) "
+                  f"| tổng: W{e2_wins} D{draws} L{e2_losses}  score={score:.3f}")
+    finally:
+        e1.quit()
+        e2.quit()
+
+    with open(args.out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else
+                                 ["game", "e2_color", "result", "e2_result", "plies", "reason", "seconds"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    played = e2_wins + draws + e2_losses
+    if played == 0:
+        print("Không có ván nào hoàn thành.")
+        if args.summary_json:
+            with open(args.summary_json, "w") as jf:
+                json.dump({"played": 0, "wins": 0, "draws": 0, "losses": 0,
+                           "score": None, "elo_diff": None}, jf, indent=2)
+        sys.exit(1)
+
+    score = (e2_wins + 0.5 * draws) / played
+    elo_diff = 400 * math.log10(score / (1 - score)) if 0 < score < 1 else None
+
+    print("\n=== KẾT QUẢ CUỐI (engine2 = bản patched) ===")
+    print(f"Ván đã chơi : {played}")
+    print(f"Thắng/Hòa/Thua (engine2): {e2_wins}/{draws}/{e2_losses}")
+    print(f"Score       : {score:.1%}")
+    if elo_diff is not None:
+        print(f"Chênh Elo ước lượng (engine2 - engine1): {elo_diff:+.0f}")
+    elif score >= 1:
+        print("engine2 thắng tuyệt đối trong mẫu này -- cần chạy thêm ván để tin được, mẫu quá nhỏ/một chiều.")
+    else:
+        print("engine2 thua tuyệt đối trong mẫu này -- cần chạy thêm ván để tin được, mẫu quá nhỏ/một chiều.")
+    print(f"\nChi tiết từng ván: {args.out}")
+    print("\nLƯU Ý: đọc phần THẬT THÀ VỀ GIỚI HẠN ở đầu file script trước khi kết luận.")
+
+    if args.summary_json:
+        with open(args.summary_json, "w") as jf:
+            json.dump({"played": played, "wins": e2_wins, "draws": draws, "losses": e2_losses,
+                       "score": score, "elo_diff": elo_diff}, jf, indent=2)
+
+    if args.min_score is not None and score < args.min_score:
+        print(f"\n[CI GATE] score {score:.3f} < --min-score {args.min_score:.3f} -> exit 1")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

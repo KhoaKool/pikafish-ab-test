@@ -1,0 +1,95 @@
+name: Pikafish A/B Elo Test
+
+# Chạy tay từ tab "Actions" trên GitHub (workflow_dispatch), điền số ván /
+# movetime / đường dẫn patch. Không tự chạy khi push, để tránh tốn phút CI
+# miễn phí ngoài ý muốn -- muốn tự động hoá theo push thì đổi phần "on:".
+on:
+  workflow_dispatch:
+    inputs:
+      patch_file:
+        description: "Đường dẫn file .patch trong repo này"
+        required: true
+        default: "patches/pikafish-aggro-FINAL3.patch"
+      games:
+        description: "Số ván"
+        required: false
+        default: "100"
+      movetime:
+        description: "ms suy nghĩ mỗi nước"
+        required: false
+        default: "300"
+      min_score:
+        description: "Ngưỡng score tối thiểu để job PASS (0.0-1.0, vd 0.5 = phải hòa vốn trở lên)"
+        required: false
+        default: "0.45"
+
+env:
+  # GitHub-hosted runner không đảm bảo CPU hỗ trợ BMI2 -- dùng AVX2, chính
+  # Makefile của Pikafish khuyến nghị đây là lựa chọn portable nhất
+  # ("A portable compile for most x86-64 systems").
+  PIKAFISH_ARCH: x86-64-avx2
+  BASE_COMMIT: 8ab92480b3b270bb7271910585acd4cc148da80b
+  PIKAFISH_REPO: https://github.com/official-pikafish/Pikafish.git
+
+jobs:
+  ab-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout this repo (patch file + scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Clone baseline Pikafish
+        run: |
+          git clone --quiet "$PIKAFISH_REPO" base
+          git -C base checkout --quiet "$BASE_COMMIT"
+
+      - name: Clone Pikafish to be patched
+        run: |
+          git clone --quiet "$PIKAFISH_REPO" patched
+          git -C patched checkout --quiet "$BASE_COMMIT"
+
+      - name: Apply patch (fail fast if it doesn't apply cleanly)
+        run: |
+          git -C patched apply --check "${{ github.event.inputs.patch_file }}"
+          git -C patched apply "${{ github.event.inputs.patch_file }}"
+
+      - name: Build baseline
+        run: make -C base/src -j"$(nproc)" profile-build ARCH="$PIKAFISH_ARCH" COMP=gcc
+
+      - name: Build patched
+        run: make -C patched/src -j"$(nproc)" profile-build ARCH="$PIKAFISH_ARCH" COMP=gcc
+
+      - name: Smoke test both binaries respond to UCI
+        run: |
+          for exe in base/src/pikafish patched/src/pikafish; do
+            echo "-- $exe --"
+            printf 'uci\nisready\nquit\n' | "$exe" | grep -E "uciok|readyok"
+          done
+
+      - name: Run A/B match
+        run: |
+          python3 pika_match.py \
+            --engine1 base/src/pikafish \
+            --engine2 patched/src/pikafish \
+            --games "${{ github.event.inputs.games }}" \
+            --movetime "${{ github.event.inputs.movetime }}" \
+            --max-plies 260 \
+            --move-timeout 15 \
+            --out results.csv \
+            --summary-json summary.json \
+            --min-score "${{ github.event.inputs.min_score }}"
+
+      - name: Upload results (always, even if the CI gate failed)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pikafish-ab-results
+          path: |
+            results.csv
+            summary.json
