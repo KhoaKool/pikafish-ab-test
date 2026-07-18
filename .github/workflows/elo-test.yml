@@ -79,16 +79,54 @@ jobs:
       - name: Build patched
         run: make -C patched/src -j4 build ARCH="$PIKAFISH_ARCH" COMP="$PIKAFISH_COMP"
 
-      - name: Smoke test both binaries respond to UCI
+      - name: Smoke test both binaries actually SEARCH (not just handshake)
         run: |
-          for exe in base/src/pikafish patched/src/pikafish; do
-            echo "-- $exe --"
-            printf 'uci\nisready\nquit\n' | "$exe" | grep -E "uciok|readyok"
+          # Lỗi ta gặp chỉ xảy ra khi engine thực sự search (lệnh 'go'), không
+          # phải lúc bắt tay UCI ('uci'/'isready'). Bước cũ chỉ test bắt tay
+          # nên không bắt được crash này. Bước mới gửi 1 lệnh 'go' thật, in
+          # TOÀN BỘ output (kể cả lỗi/segfault) thẳng ra log chính VÀ vào
+          # GitHub Step Summary -- không cần tải artifact riêng nữa.
+          set +e
+          echo "## 🔍 Search smoke test" >> "$GITHUB_STEP_SUMMARY"
+          for tag in base patched; do
+            echo "===== $tag/src/pikafish ====="
+            OUTPUT=$(printf 'uci\nisready\nucinewgame\nposition startpos\ngo movetime 500\nquit\n' \
+              | "$tag/src/pikafish" 2>&1)
+            code=$?
+            echo "$OUTPUT"
+            echo "===== $tag exit code: $code ====="
+            if [ $code -ne 0 ]; then
+              # exit code = 128 + signal number khi process bị OS kill. Các mã
+              # hay gặp: 134=SIGABRT (assert/abort), 139=SIGSEGV (segfault,
+              # lỗi bộ nhớ), 137=SIGKILL (thường do OOM killer giết vì hết RAM).
+              case $code in
+                134) SIGNAME="SIGABRT (assert()/abort() trong code -- thường có message ở trên)" ;;
+                139) SIGNAME="SIGSEGV (segfault -- lỗi truy cập bộ nhớ, KHÔNG có message, đúng như stderr rỗng bạn gặp)" ;;
+                137) SIGNAME="SIGKILL (rất có thể bị OOM killer giết vì hết RAM -- cũng KHÔNG có message)" ;;
+                *) SIGNAME="mã tín hiệu $((code - 128))" ;;
+              esac
+              echo "!!! $tag/src/pikafish CRASHED: $SIGNAME"
+              {
+                echo "### ❌ $tag/src/pikafish CRASHED"
+                echo "- Exit code: **$code** → $SIGNAME"
+                echo '```'
+                echo "$OUTPUT"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              CRASHED=1
+            else
+              echo "✅ $tag/src/pikafish: OK (exit 0)" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
+          set -e
+          if [ "${CRASHED:-0}" = "1" ]; then
+            echo "Dừng lại ở đây: ít nhất 1 binary crash khi search thật. Không chạy A/B match nữa."
+            exit 1
+          fi
 
       - name: Run A/B match
         run: |
-          python3 pika_match.py \
+          python3 -u pika_match.py \
             --engine1 base/src/pikafish \
             --engine2 patched/src/pikafish \
             --games "${{ github.event.inputs.games }}" \
