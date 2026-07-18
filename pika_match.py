@@ -81,13 +81,23 @@ class Engine:
     def _start_process(self):
         # Open in append mode so restarts don't erase earlier crash evidence.
         self._stderr_file = open(self.stderr_path, "a")
+        # Run with cwd = the engine's own directory. Pikafish looks for its
+        # default EvalFile (pikafish.nnue) relative to the binary's directory,
+        # but running it from a DIFFERENT working directory (e.g. a harness
+        # invoked from the repo root) can trip that lookup depending on how
+        # the binary was built/packaged. Setting cwd here removes the
+        # ambiguity entirely -- it's exactly what happens if a person cd's
+        # into the folder and runs the exe by hand.
+        engine_dir = os.path.dirname(os.path.abspath(self.path)) or "."
+        engine_exe = os.path.abspath(self.path)
         self.proc = subprocess.Popen(
-            [self.path],
+            [engine_exe],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self._stderr_file,
             text=True,
             bufsize=1,
+            cwd=engine_dir,
         )
         self.q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -173,6 +183,44 @@ class Engine:
             self._stderr_file.close()
         except Exception:
             pass
+
+
+def elo_from_score(score):
+    if 0 < score < 1:
+        return 400 * math.log10(score / (1 - score))
+    return None
+
+
+def fishtest_stats(wins, draws, losses):
+    """Elo 95% confidence interval + LOS (likelihood of superiority), using
+    the same formulas fishtest/cutechess-cli use: treat each game's result
+    (1/0.5/0) as a sample, compute its variance empirically, then apply the
+    normal approximation (valid once N is a few dozen+ games)."""
+    n = wins + draws + losses
+    if n == 0:
+        return None
+    p_w, p_d, p_l = wins / n, draws / n, losses / n
+    score = p_w + 0.5 * p_d
+    variance = p_w * (1 - score) ** 2 + p_d * (0.5 - score) ** 2 + p_l * (0 - score) ** 2
+    stderr = math.sqrt(variance / n) if n > 0 else 0
+    lo = elo_from_score(max(1e-9, min(1 - 1e-9, score - 1.96 * stderr)))
+    hi = elo_from_score(max(1e-9, min(1 - 1e-9, score + 1.96 * stderr)))
+    elo = elo_from_score(score)
+    # LOS = P(true score > 0.5) via normal approximation around the
+    # observed score -- standard definition used by fishtest.
+    los = 0.5 * (1 + math.erf((score - 0.5) / (stderr * math.sqrt(2)))) if stderr > 0 else (1.0 if score > 0.5 else 0.0)
+    return {"score": score, "elo": elo, "elo_lo": lo, "elo_hi": hi, "los": los, "n": n}
+
+
+def write_github_summary(md):
+    """Appends markdown to $GITHUB_STEP_SUMMARY so it renders directly on
+    the workflow run page in GitHub -- no artifact download needed. No-op
+    (safe) when not running inside GitHub Actions."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(md + "\n")
 
 
 def parse_options(spec):
@@ -334,36 +382,58 @@ def main():
     if played == 0:
         print(f"Không có ván nào hoàn thành ({aborted} ván bị abort). "
               f"Xem engine1_stderr.log / engine2_stderr.log để biết engine crash vì sao.")
+        write_github_summary(
+            f"## ❌ Pikafish A/B Test: KHÔNG có ván nào hoàn thành\n\n"
+            f"**{aborted} ván bị abort** (engine crash/treo) trước khi có bất kỳ ván nào chơi xong.\n\n"
+            f"Xem artifact `engine1_stderr.log` / `engine2_stderr.log`, hoặc bước "
+            f"\"Smoke test\" phía trên để biết engine nào crash và vì sao."
+        )
         if args.summary_json:
             with open(args.summary_json, "w") as jf:
                 json.dump({"played": 0, "wins": 0, "draws": 0, "losses": 0, "aborted": aborted,
                            "score": None, "elo_diff": None}, jf, indent=2)
         sys.exit(1)
 
-    score = (e2_wins + 0.5 * draws) / played
-    elo_diff = 400 * math.log10(score / (1 - score)) if 0 < score < 1 else None
+    stats = fishtest_stats(e2_wins, draws, e2_losses)
+    score = stats["score"]
 
-    print("\n=== KẾT QUẢ CUỐI (engine2 = bản patched) ===")
-    print(f"Ván hoàn tất: {played}   |   Ván bị abort (crash/timeout, KHÔNG tính vào score): {aborted}")
-    print(f"Thắng/Hòa/Thua (engine2): {e2_wins}/{draws}/{e2_losses}")
-    print(f"Score       : {score:.1%}")
+    print("\n=== KẾT QUẢ CUỐI (engine2 = bản patched), kiểu fishtest ===")
+    print(f"Total/Win/Draw/Lose : {played} / {e2_wins} / {draws} / {e2_losses}")
+    print(f"WinRate     : {score:.2%}")
+    if stats["elo"] is not None:
+        print(f"Elo         : {stats['elo']:+.2f} [{stats['elo_lo']:+.2f}, {stats['elo_hi']:+.2f}]  (95% CI)")
+    print(f"LOS         : {stats['los']:.2%}  (xác suất engine2 thực sự mạnh hơn engine1)")
     if aborted > 0:
-        print(f"\n!! CẢNH BÁO: {aborted} ván bị abort -- xem engine1_stderr.log / "
-              f"engine2_stderr.log để biết engine nào crash và vì sao. Score ở trên "
-              f"chỉ tính trên {played} ván THẬT SỰ chơi xong, không bị pha loãng bởi ván crash.")
-    if elo_diff is not None:
-        print(f"Chênh Elo ước lượng (engine2 - engine1): {elo_diff:+.0f}")
-    elif score >= 1:
-        print("engine2 thắng tuyệt đối trong mẫu này -- cần chạy thêm ván để tin được, mẫu quá nhỏ/một chiều.")
-    else:
-        print("engine2 thua tuyệt đối trong mẫu này -- cần chạy thêm ván để tin được, mẫu quá nhỏ/một chiều.")
+        print(f"\n!! CẢNH BÁO: {aborted} ván bị abort, KHÔNG tính vào các số trên.")
+
+    summary_md = [
+        f"## {'✅' if score >= 0.5 else '⚠️'} Pikafish A/B Test Results (fishtest-style)",
+        "",
+        f"| | |",
+        f"|---|---|",
+        f"| Total/Win/Draw/Lose | {played} / {e2_wins} / {draws} / {e2_losses} |",
+        f"| WinRate | {score:.2%} |",
+    ]
+    if stats["elo"] is not None:
+        summary_md.append(f"| Elo | {stats['elo']:+.2f} [{stats['elo_lo']:+.2f}, {stats['elo_hi']:+.2f}] (95% CI) |")
+    summary_md.append(f"| LOS | {stats['los']:.2%} |")
+    if aborted > 0:
+        summary_md.append(f"| ⚠️ Aborted (crash/timeout, excluded) | {aborted} |")
+    summary_md.append("")
+    summary_md.append(
+        "> Score < 50% hoặc khoảng tin cậy Elo bao gồm số âm lớn ⇒ patch có thể đang làm "
+        "engine YẾU ĐI, không nên kết luận vội với mẫu nhỏ."
+    )
+    write_github_summary("\n".join(summary_md))
+
     print(f"\nChi tiết từng ván: {args.out}")
     print("\nLƯU Ý: đọc phần THẬT THÀ VỀ GIỚI HẠN ở đầu file script trước khi kết luận.")
 
     if args.summary_json:
         with open(args.summary_json, "w") as jf:
             json.dump({"played": played, "wins": e2_wins, "draws": draws, "losses": e2_losses,
-                       "aborted": aborted, "score": score, "elo_diff": elo_diff}, jf, indent=2)
+                       "aborted": aborted, "score": score, "elo": stats["elo"],
+                       "elo_ci": [stats["elo_lo"], stats["elo_hi"]], "los": stats["los"]}, jf, indent=2)
 
     if args.min_score is not None and score < args.min_score:
         print(f"\n[CI GATE] score {score:.3f} < --min-score {args.min_score:.3f} -> exit 1")

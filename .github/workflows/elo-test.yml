@@ -79,6 +79,20 @@ jobs:
       - name: Build patched
         run: make -C patched/src -j4 build ARCH="$PIKAFISH_ARCH" COMP="$PIKAFISH_COMP"
 
+      - name: Check NNUE network file actually downloaded (diagnostic)
+        run: |
+          echo "## 📦 NNUE network file check" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          for f in base/src/pikafish.nnue patched/src/pikafish.nnue; do
+            if [ -f "$f" ]; then
+              ls -la "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+              file "$f" 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
+            else
+              echo "$f: KHÔNG TỒN TẠI" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Smoke test both binaries actually SEARCH (not just handshake)
         run: |
           # Lỗi ta gặp chỉ xảy ra khi engine thực sự search (lệnh 'go'), không
@@ -90,8 +104,8 @@ jobs:
           echo "## 🔍 Search smoke test" >> "$GITHUB_STEP_SUMMARY"
           for tag in base patched; do
             echo "===== $tag/src/pikafish ====="
-            OUTPUT=$(printf 'uci\nisready\nucinewgame\nposition startpos\ngo movetime 500\nquit\n' \
-              | "$tag/src/pikafish" 2>&1)
+            OUTPUT=$(cd "$tag/src" && printf 'uci\nisready\nucinewgame\nposition startpos\ngo movetime 500\nquit\n' \
+              | ./pikafish 2>&1)
             code=$?
             echo "$OUTPUT"
             echo "===== $tag exit code: $code ====="
