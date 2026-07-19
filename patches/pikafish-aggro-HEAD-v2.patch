@@ -1,0 +1,522 @@
+diff --git a/src/engine.cpp b/src/engine.cpp
+index 93792b75..d9eaa520 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -22,7 +22,9 @@
+ #include <cassert>
+ #include <filesystem>
+ #include <deque>
++#include <fstream>
+ #include <iostream>
++#include <unordered_map>
+ #include <memory>
+ #include <sstream>
+ #include <string_view>
+@@ -105,6 +107,32 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
+ 
+     options.add("Move Overhead", Option(10, 0, 5000));
+ 
++    // Hard ceiling (ms) on how long ANY single move is allowed to think, even
++    // if wtime/btime would otherwise permit more. Real "smart 30s budget":
++    // the engine still stops earlier than this via the existing stability/
++    // falling-eval formula in timeman.cpp -- this is only the upper bound.
++    options.add("MaxThinkTime", Option(30000, 100, 120000));
++
++    // Contempt: positive value makes the engine treat draws as a worse
++    // outcome for itself than VALUE_DRAW would suggest, biasing it toward
++    // sharper, non-drawish continuations. 0 = neutral (Stockfish default
++    // behavior). Expressed in centipawns, converted to internal Value units
++    // (PawnValue == 144 internal ~= 100 cp) where it's consumed.
++    options.add("Contempt", Option(0, -100, 100));
++
++    // Writes ONLY the moves where the root search's best score regressed
++    // sharply between two consecutive completed depths (a caught "blind
++    // spot"), one line per event, to <Desktop>/pikafish_blindspots.log.
++    // Does not log the whole game -- see log_blind_spot() in search.cpp.
++    options.add("BlindSpotLog", Option(true));
++
++    // When enabled, at the start of each search the engine checks its own
++    // persistent "learned mistakes" file (Desktop/pikafish_learned.log) for
++    // moves previously refuted from this EXACT position (Zobrist key match)
++    // and searches them last instead of first. It never excludes them --
++    // if nothing better exists the full search still finds and plays them.
++    options.add("LearnFromMistakes", Option(true));
++
+     options.add("nodestime", Option(0, 0, 10000));
+ 
+     options.add("UCI_ShowWDL", Option(false));
+@@ -115,10 +143,27 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
+           return std::nullopt;
+       }));
+ 
++    // Con đường 1 (book lookup): before searching, check the exact CURRENT
++    // position against a table of high-confidence moves harvested from
++    // real self-play analysis (depth >= 30, or up to several minutes for
++    // hard positions -- see build_book.py). An exact match plays instantly
++    // (no search at all needed), which is the only way to genuinely get
++    // "depth-30 quality in ~0.1s" -- it only ever helps for positions
++    // literally already seen before, unlike NNUE fine-tuning (a much larger
++    // undertaking) which would generalize to similar-but-new positions too.
++    options.add("OwnBook", Option(true));
++    options.add(  //
++      "BookFile", Option("pikafish_book.obk", [this](const Option& o) {
++          load_own_book(std::string(o));
++          return std::nullopt;
++      }));
++
+     network = get_default_network();
+     threads.clear();
+     threads.ensure_network_replicated();
+     resize_threads();
++
++    load_own_book("pikafish_book.obk");  // ok if this file doesn't exist yet -- OwnBook then simply has nothing to offer
+ }
+ 
+ std::variant<u64, PositionSetError> Engine::perft(const std::string& fen, Depth depth) {
+@@ -131,6 +176,26 @@ void Engine::go(Search::LimitsType& limits) {
+     assert(limits.perft == 0);
+     verify_network();
+ 
++    // Con đường 1: exact-position book lookup. Only ever fires for a
++    // position byte-for-byte identical (same Zobrist key) to one already
++    // confirmed via deep self-play analysis -- see load_own_book(). Never a
++    // partial/fuzzy match, so this can't misfire on a "similar" position;
++    // UCIEngine::to_move() also re-validates the stored move is still
++    // legal here before using it, in case of a stale/corrupted book entry.
++    if (options["OwnBook"] && !ownBook.empty())
++    {
++        auto it = ownBook.find(pos.key());
++        if (it != ownBook.end())
++        {
++            Move m = UCIEngine::to_move(pos, it->second);
++            if (m != Move::none())
++            {
++                updateContext.onBestmove(it->second, "");
++                return;
++            }
++        }
++    }
++
+     threads.start_thinking(pos, states, limits);
+ }
+ void Engine::stop() { threads.stop = true; }
+@@ -291,6 +356,37 @@ void Engine::save_network(const std::optional<std::filesystem::path>& file) {
+       [&file, this](NN::Network& network_) { network_.save(networkFile, file); });
+ }
+ 
++void Engine::load_own_book(const std::string& path) {
++    ownBook.clear();
++
++    std::ifstream in(path);
++    if (!in.is_open())
++        return;  // no book yet (or bad path) -- OwnBook simply has nothing to offer, not an error
++
++    std::string line;
++    while (std::getline(in, line))
++    {
++        // Lines look like: fen=<FEN> move=<uci> depth=<int> source=<tag>
++        // The FEN itself may contain spaces, so locate each "key=" marker
++        // explicitly rather than splitting on whitespace.
++        auto fenPos  = line.find("fen=");
++        auto movePos = line.find(" move=");
++        if (fenPos == std::string::npos || movePos == std::string::npos || movePos <= fenPos)
++            continue;
++
++        std::string fen        = line.substr(fenPos + 4, movePos - (fenPos + 4));
++        auto        afterMove  = movePos + 6;
++        auto        depthPos   = line.find(" depth=", afterMove);
++        std::string moveStr    = depthPos == std::string::npos ? line.substr(afterMove)
++                                                                 : line.substr(afterMove, depthPos - afterMove);
++
++        Position  tempPos;
++        StateInfo si;
++        if (!tempPos.set(fen, &si).has_value())
++            ownBook[tempPos.key()] = moveStr;
++    }
++}
++
+ // utility functions
+ 
+ void Engine::trace_eval() const {
+diff --git a/src/engine.h b/src/engine.h
+index 670540fa..601c629f 100644
+--- a/src/engine.h
++++ b/src/engine.h
+@@ -26,6 +26,7 @@
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <unordered_map>
+ #include <utility>
+ #include <variant>
+ #include <vector>
+@@ -93,6 +94,7 @@ class Engine {
+     std::unique_ptr<Eval::NNUE::Network> get_default_network();
+     void                                 load_network(const std::filesystem::path& file);
+     void save_network(const std::optional<std::filesystem::path>& file);
++    void load_own_book(const std::string& path);
+ 
+     // utility functions
+ 
+@@ -128,6 +130,11 @@ class Engine {
+ 
+     Search::SearchManager::UpdateContext  updateContext;
+     std::function<void(std::string_view)> onVerifyNetwork;
++
++    // Con đường 1 book: Zobrist key -> UCI move string, loaded from
++    // BookFile (see load_own_book() in engine.cpp). Only touched from the
++    // main UCI command thread (option changes, go()), so no locking needed.
++    std::unordered_map<Key, std::string> ownBook;
+     std::map<NumaIndex, SharedHistories>  sharedHists;
+ };
+ 
+diff --git a/src/movepick.cpp b/src/movepick.cpp
+index 46d66395..082b9a08 100644
+--- a/src/movepick.cpp
++++ b/src/movepick.cpp
+@@ -30,6 +30,13 @@ namespace Stockfish {
+ 
+ namespace {
+ 
++// Penalty subtracted from a capture's ordering score when it is an "aimless"
++// Rook-for-Rook trade in the opening/early middlegame (see score<CAPTURES>()).
++// Sized comfortably above the +7*PieceValue term range so it reliably pushes
++// such trades out of GOOD_CAPTURE into BAD_CAPTURE ordering, without ever
++// excluding the move from being searched.
++constexpr int ROOK_TRADE_PENALTY = 6000;
++
+ enum Stages {
+     // generate main search moves
+     MAIN_TT,
+@@ -222,9 +229,38 @@ ExtMove* MovePicker::score(const MoveList<Type>& ml) {
+         const Piece     capturedPiece = pos.piece_on(to);
+ 
+         if constexpr (Type == CAPTURES)
++        {
+             m.value = (*captureHistory)[pc][to][type_of(capturedPiece)]
+                     + 7 * int(PieceValue[capturedPiece]);
+ 
++            // Anti "Xe tao lao" heuristic: discourage initiating a Chariot-for-Chariot
++            // trade in the first 20 moves (40 plies) unless the net material swing is
++            // at least a Knight's value (i.e. it is not a pure like-for-like trade).
++            // This only biases move ORDERING (search stays complete: no move is pruned,
++            // just searched later / more shallowly via LMR), so correctness and mate
++            // detection are unaffected. Branchless: implemented as bool->int multiply,
++            // no extra conditional jumps in the hot capture-scoring loop.
++            const bool earlyGame  = pos.game_ply() < 40;
++            const bool rookTrade  = (pt == ROOK) & (type_of(capturedPiece) == ROOK);
++            const int  netGain    = int(PieceValue[capturedPiece]) - int(PieceValue[pc]);
++            const bool worthwhile = netGain >= int(KnightValue);
++
++            m.value -= int(earlyGame & rookTrade & !worthwhile) * ROOK_TRADE_PENALTY;
++
++            // Bonus for eliminating an enemy pawn that has already crossed the
++            // river: such pawns gain sideways mobility and become a growing
++            // threat to our King/palace the longer they survive, so we bias
++            // ordering to clear them out. Uses the same rank test Pikafish's
++            // own pawn_attacks_bb() uses to decide river-crossing (bitboard.h),
++            // so this matches the engine's own notion of "crossed" exactly.
++            const Color capturedColor = color_of(capturedPiece);
++            const bool  isCrossedPawn =
++              (type_of(capturedPiece) == PAWN)
++              && ((capturedColor == WHITE && rank_of(to) > RANK_4)
++                  || (capturedColor == BLACK && rank_of(to) < RANK_5));
++            m.value += int(isCrossedPawn) * 400;
++        }
++
+         else if constexpr (Type == QUIETS)
+         {
+             // histories
+diff --git a/src/search.cpp b/src/search.cpp
+index 68d3a74d..6a6198ce 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -25,6 +25,9 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <unordered_map>
+ #include <initializer_list>
+ #include <string>
+ #include <utility>
+@@ -53,6 +56,90 @@ using namespace Search;
+ 
+ namespace {
+ 
++// Shared helper for resolving <home>/Desktop/<name>, used by both the
++// blind-spot log and the learned-mistakes store so they stay consistent
++// across platforms (Windows: USERPROFILE, Linux/macOS: HOME).
++std::string desktop_path(const char* filename) {
++#ifdef _WIN32
++    const char* home = std::getenv("USERPROFILE");
++#else
++    const char* home = std::getenv("HOME");
++#endif
++    return (home ? std::string(home) : std::string(".")) + "/Desktop/" + filename;
++}
++
++// Appends one line to a curated "blind spot" log on the user's Desktop --
++// NOT the whole game, only moments where the root's best score regressed
++// sharply between two consecutive completed depths. That pattern means a
++// shallower search (the kind a 2s time budget can be cut off at) would have
++// reported a move this engine now knows is worse than it first looked, i.e.
++// an evaluation blind spot. Intended for manual review/hand-tuning since
++// retraining the NNUE net is out of scope for this project.
++//
++// Called from the main thread only (see call site in iterative_deepening),
++// so the lazily-initialized static ofstream needs no locking. Any failure to
++// open/write the file is swallowed silently -- logging must never be able
++// to affect the search itself.
++void log_blind_spot(const Position& rootPos, Depth depth, Value oldScore, Value newScore, Move bestMove) {
++
++    static std::ofstream logFile(desktop_path("pikafish_blindspots.log"), std::ios::app);
++
++    if (!logFile.is_open())
++        return;
++
++    const int prevCp = UCIEngine::to_cp(oldScore, rootPos);
++    const int newCp  = UCIEngine::to_cp(newScore, rootPos);
++
++    logFile << "depth=" << depth << " move=" << UCIEngine::move(bestMove) << " prev_cp=" << prevCp
++            << " new_cp=" << newCp << " drop_cp=" << (prevCp - newCp) << " fen=" << rootPos.fen()
++            << '\n';
++    logFile.flush();
++}
++
++// Persistent "learned mistakes" table: Zobrist key -> moves previously
++// refuted from that EXACT position (a shallower iteration thought the move
++// was good, a deeper one proved it wasn't -- see log_blind_spot's caller).
++// Loaded once from disk (Desktop/pikafish_learned.log) via a magic-static,
++// so initialization is thread-safe; all subsequent reads/writes are done
++// from the main thread ONLY (see call sites), so no locking is needed.
++std::unordered_map<Key, std::vector<Move>>& learned_bad_moves() {
++    static std::unordered_map<Key, std::vector<Move>> table = [] {
++        std::unordered_map<Key, std::vector<Move>> t;
++        std::ifstream                              in(desktop_path("pikafish_learned.log"));
++        std::string                                line;
++        while (std::getline(in, line))
++        {
++            std::istringstream iss(line);
++            std::string        keyTok, moveTok;
++            if (iss >> keyTok >> moveTok)
++                t[Key(std::strtoull(keyTok.c_str(), nullptr, 16))].push_back(
++                  Move(std::uint16_t(std::strtoul(moveTok.c_str(), nullptr, 16))));
++        }
++        return t;
++    }();
++    return table;
++}
++
++bool is_learned_bad(Key key, Move m) {
++    auto it = learned_bad_moves().find(key);
++    return it != learned_bad_moves().end()
++        && std::find(it->second.begin(), it->second.end(), m) != it->second.end();
++}
++
++// Records (key, move) as a known regression. Deduped in memory first, so a
++// repeat of the same lesson never grows the file -- matches the requirement
++// to log only NEW mistakes, not every time the same one recurs.
++void remember_bad_move(Key key, Move m) {
++    auto& vec = learned_bad_moves()[key];
++    if (std::find(vec.begin(), vec.end(), m) != vec.end())
++        return;
++    vec.push_back(m);
++
++    std::ofstream out(desktop_path("pikafish_learned.log"), std::ios::app);
++    if (out.is_open())
++        out << std::hex << key << ' ' << m.raw() << std::dec << '\n';
++}
++
+ constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
+ 
+ constexpr int SEARCHEDLIST_CAPACITY = 32;
+@@ -261,6 +348,7 @@ bool Search::Worker::iterative_deepening() {
+     Value  alpha, beta;
+     Value  bestValue     = -VALUE_INFINITE;
+     Color  us            = rootPos.side_to_move();
++    rootColor            = us;
+     double timeReduction = 1, totBestMoveChanges = 0;
+     int    delta, iterIdx                        = 0;
+ 
+@@ -295,6 +383,20 @@ bool Search::Worker::iterative_deepening() {
+ 
+     multiPV = std::min(multiPV, rootMoves.size());
+ 
++    // Cross-game learned avoidance: soft-deprioritize (never exclude) any
++    // root move we've previously recorded as refuted -- "looked good at
++    // shallow depth, wasn't" -- from this EXACT position (Zobrist key match).
++    // Only reorders the initial list, so alternatives get explored first;
++    // full search still covers every move, so a genuinely forced/best move
++    // is still found and played (matches "nếu không phá giải được thì đi
++    // nước ít tổn thất nhất"). Main-thread only: learned_bad_moves() is a
++    // shared, non-locked table, and only the main thread ever mutates it
++    // (see remember_bad_move() call site below), so this read is race-free.
++    if (is_mainthread() && options["LearnFromMistakes"])
++        std::stable_partition(rootMoves.begin(), rootMoves.end(), [&](const RootMove& rm) {
++            return !is_learned_bad(rootPos.key(), rm.pv[0]);
++        });
++
+     int  searchAgainCounter = 0;
+     bool uciPvSent          = false;
+ 
+@@ -346,9 +448,16 @@ bool Search::Worker::iterative_deepening() {
+             alpha     = std::max(avg - delta, -VALUE_INFINITE);
+             beta      = std::min(avg + delta, VALUE_INFINITE);
+ 
+-            // Adjust optimism based on root move's averageScore
+-            optimism[us]  = 92 * avg / (std::abs(avg) + 95);
+-            optimism[~us] = -optimism[us];
++            // Adjust optimism based on root move's averageScore.
++            // Dynamic aggression ("Lúc yếu thủ vững, ưu the cong dồn dập"):
++            // thresholds are expressed in internal Value units (PawnValue == 144),
++            // so +36 ~= +0.25 pawn and -72 ~= -0.5 pawn, matching the intended
++            // eval bands. This only rescales the existing optimism term used by
++            // Eval::evaluate() -- it runs once per PV per iteration at the root,
++            // not inside the per-node NNUE hot path, so NPS is unaffected.
++            const int aggressionScale = avg > 36 ? 115 : (avg < -72 ? 78 : 92);
++            optimism[us]              = aggressionScale * avg / (std::abs(avg) + 95);
++            optimism[~us]             = -optimism[us];
+ 
+             // Start with a small aspiration window and, in the case of a fail
+             // high/low, re-search with a bigger window until we don't fail
+@@ -475,8 +584,41 @@ bool Search::Worker::iterative_deepening() {
+                                 && (std::abs(rootMoves[0].score) < std::abs(lastBestMoveScore)
+                                     || rootMoves[0].score_is_bound());
+ 
++        // Root score regression ("blind spot") detection: the previous
++        // iteration found lastBestMoveScore; if what we now believe is best
++        // just dropped sharply, a shallower search (the kind a time budget
++        // can be cut off at) would have been fooled. Detected unconditionally
++        // (main thread only) -- BlindSpotLog/LearnFromMistakes below only
++        // gate what we DO with the detection, not the detection itself, since
++        // "think longer when we just caught ourselves being wrong" should
++        // always apply.
++        constexpr Value RegressionThreshold = 60;  // ~0.4 pawn (PawnValue == 144)
++        bool             regressionExtend   = false;
++
+         if (!threads.stop)
+         {
++            const bool regressed =
++              is_mainthread() && rootDepth >= 6 && lastBestMoveScore != -VALUE_INFINITE
++              && !is_decisive(lastBestMoveScore) && !is_decisive(rootMoves[0].score)
++              && lastBestMoveScore - rootMoves[0].score >= RegressionThreshold;
++
++            if (regressed)
++            {
++                regressionExtend = true;
++
++                if (options["BlindSpotLog"])
++                    log_blind_spot(rootPos, rootDepth, lastBestMoveScore, rootMoves[0].score,
++                                    rootMoves[0].pv[0]);
++
++                // Remember the move that WAS considered best a moment ago, if
++                // a different move has since taken over -- the concrete
++                // "looked good but wasn't" lesson worth avoiding if this
++                // exact position recurs (see is_learned_bad() usage above).
++                if (options["LearnFromMistakes"] && !lastBestMovePV.empty()
++                    && rootMoves[0].pv[0] != lastBestMovePV[0])
++                    remember_bad_move(rootPos.key(), lastBestMovePV[0]);
++            }
++
+             if (lastBestMovePV.empty() || lastBestMovePV[0] != rootMoves[0].pv[0])
+                 lastBestMoveDepth = rootDepth;
+ 
+@@ -554,9 +696,26 @@ bool Search::Worker::iterative_deepening() {
+             double totalTime = mainThread->tm.optimum() * fallingEval * reduction
+                              * bestMoveInstability * highBestMoveEffort;
+ 
++            // If we just caught a root score regression (see detection above),
++            // this move needs more thought than usual to be sure the "fix" is
++            // real and not itself another blind spot -- so grant extra budget
++            // out of the same optimum/maximum envelope (tm.maximum() below,
++            // itself already hard-capped by MaxThinkTime in timeman.cpp, so
++            // this can never exceed the configured ceiling).
++            if (regressionExtend)
++                totalTime *= 1.5;
++
+             if (rootMoves.size() == 1)
+                 threads.stop = true;
+ 
++            // "Thấy nước mate thì đi ngay": once a decisive (mate / proven
++            // forced win or loss) score has survived being re-confirmed for
++            // at least one extra depth (guards against a same-depth mate
++            // mirage), stop immediately instead of spending the rest of the
++            // optimum/maximum time budget on it.
++            if (is_decisive(rootMoves[0].score) && rootDepth >= lastBestMoveDepth + 2)
++                threads.stop = true;
++
+             auto elapsedTime = elapsed();
+ 
+             // Stop the search if we have exceeded totalTime or maximum time,
+@@ -719,7 +878,28 @@ Value Search::Worker::search(
+         // Step 2. Check for aborted search and repetition
+         Value result = VALUE_NONE;
+         if (pos.rule_judge(result, ss->ply))
+-            return result == VALUE_DRAW ? value_draw(nodes) : result;
++        {
++            if (result != VALUE_DRAW)
++                return result;
++
++            Value dv = value_draw(nodes);
++
++            // Contempt: bias draw scores away from neutral so the engine
++            // treats a draw as (slightly) worse for itself than for the
++            // opponent, encouraging it to keep playing for a win instead of
++            // steering into repetition/60-move draws. `dv` here is relative
++            // to the side to move AT THIS NODE (nega-max convention), so we
++            // subtract when that side is our own root color and add back
++            // when it is the opponent's, keeping signs consistent as the
++            // score is negated back up the tree.
++            if (int contemptCp = int(options["Contempt"]))
++            {
++                Value contemptVal = Value(contemptCp * 144 / 100);  // cp -> internal units
++                dv -= (pos.side_to_move() == rootColor ? contemptVal : -contemptVal);
++            }
++
++            return dv;
++        }
+         if (result != VALUE_NONE)
+         {
+             assert(result != VALUE_DRAW);
+diff --git a/src/search.h b/src/search.h
+index 1d780d85..b7e4f7e3 100644
+--- a/src/search.h
++++ b/src/search.h
+@@ -365,6 +365,12 @@ class Worker {
+     // The main thread has a SearchManager, the others have a NullSearchManager
+     std::unique_ptr<ISearchManager> manager;
+ 
++    // Side to move at the root of the current search; set once per
++    // iterative_deepening() call. Used to apply Contempt asymmetrically
++    // (relative to the engine's own color) when a draw is detected deep
++    // in the tree, where nega-max values are relative to the node's stm.
++    Color rootColor = WHITE;
++
+     const OptionsMap&                                        options;
+     ThreadPool&                                              threads;
+     TranspositionTable&                                      tt;
+diff --git a/src/timeman.cpp b/src/timeman.cpp
+index 68eadf74..3867392c 100644
+--- a/src/timeman.cpp
++++ b/src/timeman.cpp
+@@ -132,6 +132,18 @@ void TimeManagement::init(Search::LimitsType& limits,
+ 
+     if (options["Ponder"])
+         optimumTime += optimumTime / 4;
++
++    // Hard ceiling on per-move thinking time (default 30000ms). This never makes
++    // the engine think LONGER than the normal formula above would already allow
++    // -- it only clamps the rare cases (huge base time, big increment) where the
++    // formula would otherwise exceed the requested budget. std::min is branchless
++    // in practice and this runs once per move (init()), not per node.
++    TimePoint maxThink = TimePoint(options["MaxThinkTime"]);
++    if (maxThink > 0)
++    {
++        optimumTime = std::min(optimumTime, maxThink);
++        maximumTime = std::min(maximumTime, maxThink);
++    }
+ }
+ 
+ }  // namespace Stockfish

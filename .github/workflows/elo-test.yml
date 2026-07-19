@@ -9,7 +9,7 @@ on:
       patch_file:
         description: "Đường dẫn file .patch trong repo này"
         required: true
-        default: "patches/pikafish-aggro-HEAD.patch"
+        default: "patches/pikafish-aggro-HEAD-v2.patch"
       games:
         description: "Số ván"
         required: false
@@ -180,6 +180,7 @@ jobs:
             --out results.csv \
             --summary-json summary.json \
             --min-score "${{ github.event.inputs.min_score }}" \
+            --e2-options "OwnBook=false" \
             $BOOK_ARGS
 
       - name: Promote candidate positions to depth>=30 (bounded)
