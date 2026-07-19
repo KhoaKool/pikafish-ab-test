@@ -22,6 +22,14 @@ on:
         description: "Ngưỡng score tối thiểu để job PASS (0.0-1.0, vd 0.5 = phải hòa vốn trở lên)"
         required: false
         default: "0.45"
+      build_book:
+        description: "Có xây .obk book (chỉ trung+tàn cuộc, khai cuộc đã có CDB online) không"
+        required: false
+        default: "true"
+      promote_candidates:
+        description: "Số vị trí tối đa nâng cấp lên depth>=30 mỗi lần chạy (0 = bỏ qua bước này)"
+        required: false
+        default: "5"
 
 env:
   # Dùng đúng công thức build mà chính CI của official-pikafish/Pikafish đã
@@ -45,6 +53,8 @@ jobs:
   ab-test:
     runs-on: ubuntu-22.04
     timeout-minutes: 480
+    permissions:
+      contents: write  # needed to commit the growing .obk book back to this repo
     steps:
       - name: Checkout this repo (patch file + scripts)
         uses: actions/checkout@v4
@@ -144,18 +154,57 @@ jobs:
             exit 1
           fi
 
-      - name: Run A/B match
+      - name: Ensure book directory + files exist (first run creates them)
         run: |
+          mkdir -p book
+          touch book/pikafish_book.obk book/pikafish_book_candidates.obk
+          echo "Book hiện có: $(grep -c . book/pikafish_book.obk 2>/dev/null || echo 0) vị trí đã xác nhận, " \
+               "$(grep -c . book/pikafish_book_candidates.obk 2>/dev/null || echo 0) đang chờ nâng cấp."
+
+      - name: Run A/B match (with book-building)
+        run: |
+          BOOK_ARGS=""
+          if [ "${{ github.event.inputs.build_book }}" = "true" ]; then
+            BOOK_ARGS="--obk-path book/pikafish_book.obk --obk-candidates-path book/pikafish_book_candidates.obk --use-cdb"
+          fi
           python3 -u pika_match.py \
             --engine1 base/src/pikafish \
             --engine2 patched/src/pikafish \
             --games "${{ github.event.inputs.games }}" \
             --movetime "${{ github.event.inputs.movetime }}" \
+            --opening-plies 8 \
+            --opening-multipv 4 \
+            --opening-movetime 100 \
             --max-plies 260 \
             --move-timeout 15 \
             --out results.csv \
             --summary-json summary.json \
-            --min-score "${{ github.event.inputs.min_score }}"
+            --min-score "${{ github.event.inputs.min_score }}" \
+            $BOOK_ARGS
+
+      - name: Promote candidate positions to depth>=30 (bounded)
+        if: github.event.inputs.build_book == 'true' && github.event.inputs.promote_candidates != '0'
+        run: |
+          python3 -u build_book.py \
+            --engine patched/src/pikafish \
+            --candidates book/pikafish_book_candidates.obk \
+            --obk book/pikafish_book.obk \
+            --min-depth 30 --max-time 300 \
+            --limit "${{ github.event.inputs.promote_candidates }}"
+
+      - name: Commit updated book back to this repo
+        if: github.event.inputs.build_book == 'true'
+        run: |
+          git config user.name "pikafish-book-bot"
+          git config user.email "actions@github.com"
+          git add book/pikafish_book.obk book/pikafish_book_candidates.obk
+          if git diff --cached --quiet; then
+            echo "Book không đổi, không commit."
+          else
+            N=$(grep -c . book/pikafish_book.obk 2>/dev/null || echo 0)
+            git commit -m "Update book: ${N} vị trí đã xác nhận [skip ci]"
+            git push
+          fi
 
       - name: Upload results (always, even if the CI gate failed)
         if: always()
