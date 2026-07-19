@@ -111,16 +111,16 @@ jobs:
 
       - name: Smoke test both binaries actually SEARCH (not just handshake)
         run: |
-          # Lỗi ta gặp chỉ xảy ra khi engine thực sự search (lệnh 'go'), không
-          # phải lúc bắt tay UCI ('uci'/'isready'). Bước cũ chỉ test bắt tay
-          # nên không bắt được crash này. Bước mới gửi 1 lệnh 'go' thật, in
-          # TOÀN BỘ output (kể cả lỗi/segfault) thẳng ra log chính VÀ vào
-          # GitHub Step Summary -- không cần tải artifact riêng nữa.
+          # Lỗi lần trước xảy ra trong generate_opening() (lệnh 'd' lấy FEN +
+          # 'setoption MultiPV' + go) -- bước smoke test CŨ chỉ test 'go' đơn
+          # giản, không test đúng chuỗi lệnh này nên không bắt được. Bước mới
+          # gửi ĐÚNG chuỗi lệnh thật generate_opening() dùng, in TOÀN BỘ
+          # output thẳng ra log chính VÀ GitHub Step Summary.
           set +e
           echo "## 🔍 Search smoke test" >> "$GITHUB_STEP_SUMMARY"
           for tag in base patched; do
             echo "===== $tag/src/pikafish ====="
-            OUTPUT=$(cd "$tag/src" && printf 'uci\nisready\nucinewgame\nposition startpos\ngo movetime 500\nquit\n' \
+            OUTPUT=$(cd "$tag/src" && printf 'uci\nisready\nucinewgame\nposition startpos\nd\nisready\nsetoption name MultiPV value 4\nisready\ngo movetime 500\nquit\n' \
               | ./pikafish 2>&1)
             code=$?
             echo "$OUTPUT"
