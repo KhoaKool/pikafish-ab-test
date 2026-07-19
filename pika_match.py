@@ -52,6 +52,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -170,6 +171,48 @@ class Engine:
         parts = line.split()
         return parts[1] if len(parts) > 1 else "(none)"
 
+    def set_multipv(self, k, timeout_s=10.0):
+        self.send(f"setoption name MultiPV value {k}")
+        self.send("isready")
+        self.wait_for("readyok", timeout=timeout_s)
+
+    def go_and_get_random_opening_move(self, moves, movetime_ms, timeout_s, k):
+        """Picks a RANDOM move among the engine's own top-k MultiPV
+        candidates instead of always the single best one. Every candidate
+        comes straight from the engine's own legal-move generator (parsed
+        from its real 'info ... multipv N ... pv <move> ...' output), so
+        this can never produce an illegal move -- unlike a hand-written
+        opening book, which risks silently breaking games if a move turns
+        out wrong. Falls back to the plain bestmove if MultiPV parsing finds
+        nothing (e.g. engine reports 0 lines before mating/being mated)."""
+        pos_cmd = "position startpos"
+        if moves:
+            pos_cmd += " moves " + " ".join(moves)
+        self.send(pos_cmd)
+        self.send(f"go movetime {movetime_ms}")
+
+        candidates = {}
+        bestmove = "(none)"
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            line = self.readline(timeout=max(0.1, deadline - time.time()))
+            if line.startswith("info") and " multipv " in line and " pv " in line:
+                toks = line.split()
+                try:
+                    idx = int(toks[toks.index("multipv") + 1])
+                    mv = toks[toks.index("pv") + 1]
+                    candidates[idx] = mv
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                bestmove = parts[1] if len(parts) > 1 else "(none)"
+                break
+
+        if not candidates:
+            return bestmove
+        return random.choice(list(candidates.values()))
+
     def quit(self):
         try:
             self.send("quit")
@@ -248,14 +291,48 @@ def looks_repetitive(moves, window=8, repeats=3):
     return all(tail[i * window:(i + 1) * window] == block for i in range(repeats))
 
 
-def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s):
+def generate_opening(engine, plies, multipv, movetime_ms, timeout_s):
+    """Generates a single random opening sequence (list of UCI moves) using
+    ONE engine's own top-K MultiPV candidates at each ply, picked randomly.
+    Used to create a SHARED opening for a "paired" pair of games (see
+    play_pair below) -- fishtest's standard technique: play the identical
+    opening twice with colors swapped, which cancels out most of the
+    opening's own bias toward one side, so far fewer total games are needed
+    to see a real strength difference than with independent random openings
+    per game."""
+    engine.new_game()
+    if multipv > 1:
+        engine.set_multipv(multipv, timeout_s=timeout_s)
+    moves = []
+    for ply in range(plies):
+        move = engine.go_and_get_random_opening_move(moves, movetime_ms, timeout_s, multipv)
+        if move == "(none)":
+            break  # got mated inside the "opening" -- just use what we have
+        moves.append(move)
+    if multipv > 1:
+        engine.set_multipv(1, timeout_s=timeout_s)
+    return moves
+
+
+def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s,
+               opening_moves=None):
     """red_engine moves first (Red always opens in Xiangqi). Returns
-    (result, plies, reason) where result is 'red', 'black', or 'draw'."""
+    (result, plies, reason) where result is 'red', 'black', or 'draw'.
+
+    opening_moves: an optional pre-generated move sequence (see
+    generate_opening) that both engines are seeded with before real play
+    starts. Passing the SAME sequence into two calls (with red/black
+    swapped) is what "paired openings" means."""
     red_engine.new_game()
     black_engine.new_game()
 
-    moves = []
-    for ply in range(max_plies):
+    moves = list(opening_moves) if opening_moves else []
+    start_ply = len(moves)
+
+    if looks_repetitive(moves):
+        return "draw", start_ply, "repetition_heuristic"
+
+    for ply in range(start_ply, max_plies):
         mover = red_engine if ply % 2 == 0 else black_engine
         move = mover.go_and_get_move(moves, movetime_ms, move_timeout_s)
 
@@ -280,6 +357,16 @@ def main():
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--movetime", type=int, default=1000, help="ms per move")
     ap.add_argument("--max-plies", type=int, default=260)
+    ap.add_argument("--opening-plies", type=int, default=0,
+                     help="First N plies pick randomly among the mover's own top-K MultiPV "
+                          "candidates instead of always its best move, to create game-to-game "
+                          "variety. 0 = disabled (every game starts identically -- near-identical "
+                          "engines will then draw constantly and tell you nothing).")
+    ap.add_argument("--opening-multipv", type=int, default=4,
+                     help="K in the above -- how many top candidates to randomly choose among.")
+    ap.add_argument("--opening-movetime", type=int, default=100,
+                     help="ms per move during the opening phase (kept short -- these moves don't "
+                          "need to be deep, just legal and reasonable).")
     ap.add_argument("--move-timeout", type=float, default=30.0,
                      help="Seconds to wait for a single bestmove before aborting the game")
     ap.add_argument("--e1-options", default="", help="e.g. Contempt=0,MaxThinkTime=30000")
@@ -309,6 +396,7 @@ def main():
     e2_wins = e2_losses = draws = aborted = 0
     consecutive_aborts = 0
     rows = []
+    current_opening = []
 
     try:
         for g in range(args.games):
@@ -320,10 +408,31 @@ def main():
                     print(f"[game {g}] {name} engine ({eng.path}) had died -- restarted "
                           f"(see {eng.stderr_path} for why it crashed)")
 
+            # Paired openings (fishtest-style): every EVEN game generates a
+            # fresh random opening; the following ODD game replays the exact
+            # same opening with colors swapped. This cancels out most of the
+            # "this particular opening just happens to favor one side"
+            # noise, so far fewer total games are needed to see a real
+            # strength difference than with an independent random opening
+            # every single game.
+            if args.opening_plies > 0:
+                if g % 2 == 0:
+                    try:
+                        current_opening = generate_opening(
+                            e1, args.opening_plies, args.opening_multipv,
+                            args.opening_movetime, args.move_timeout)
+                    except (TimeoutError, ConnectionError) as exc:
+                        print(f"[game {g}] opening generation failed ({exc}), using empty opening")
+                        current_opening = []
+            else:
+                current_opening = []
+
             t0 = time.time()
             aborted_this_game = False
             try:
-                result, plies, reason = play_game(red, black, args.movetime, args.max_plies, args.move_timeout)
+                result, plies, reason = play_game(
+                    red, black, args.movetime, args.max_plies, args.move_timeout,
+                    opening_moves=current_opening)
             except (TimeoutError, ConnectionError) as exc:
                 print(f"[game {g}] ABORTED: {exc}")
                 result, plies, reason = "aborted", 0, f"aborted:{exc}"
@@ -339,9 +448,10 @@ def main():
                           f"engine đang crash lặp lại, không phải sự cố ngẫu nhiên. "
                           f"Kiểm tra engine1_stderr.log / engine2_stderr.log để biết lý do thật.")
                     rows.append({
-                        "game": g, "e2_color": "red" if e2_is_red else "black",
+                        "game": g, "pair_id": g // 2, "e2_color": "red" if e2_is_red else "black",
                         "result": result, "e2_result": e2_result,
                         "plies": plies, "reason": reason, "seconds": round(dt, 1),
+                        "opening": " ".join(current_opening),
                     })
                     break
             else:
@@ -359,9 +469,10 @@ def main():
                         e2_result = "loss"
 
             rows.append({
-                "game": g, "e2_color": "red" if e2_is_red else "black",
+                "game": g, "pair_id": g // 2, "e2_color": "red" if e2_is_red else "black",
                 "result": result, "e2_result": e2_result,
                 "plies": plies, "reason": reason, "seconds": round(dt, 1),
+                "opening": " ".join(current_opening),
             })
 
             played = e2_wins + draws + e2_losses
@@ -374,7 +485,8 @@ def main():
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else
-                                 ["game", "e2_color", "result", "e2_result", "plies", "reason", "seconds"])
+                                 ["game", "pair_id", "e2_color", "result", "e2_result", "plies",
+                                  "reason", "seconds", "opening"])
         writer.writeheader()
         writer.writerows(rows)
 
