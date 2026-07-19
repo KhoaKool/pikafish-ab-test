@@ -54,6 +54,8 @@ import os
 import queue
 import random
 import re
+import urllib.parse
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -155,10 +157,10 @@ class Engine:
         self.send("isready")
         self.wait_for("readyok")
 
-    def new_game(self):
+    def new_game(self, timeout_s=10.0):
         self.send("ucinewgame")
         self.send("isready")
-        self.wait_for("readyok")
+        self.wait_for("readyok", timeout=timeout_s)
 
     def go_and_get_move(self, moves, movetime_ms, timeout_s):
         pos_cmd = "position startpos"
@@ -166,10 +168,25 @@ class Engine:
             pos_cmd += " moves " + " ".join(moves)
         self.send(pos_cmd)
         self.send(f"go movetime {movetime_ms}")
-        line = self.wait_for("bestmove", timeout=timeout_s)
-        # "bestmove e2e4 ponder e7e5"  or  "bestmove (none)"
-        parts = line.split()
-        return parts[1] if len(parts) > 1 else "(none)"
+        last_depth = 0
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            line = self.readline(timeout=max(0.1, deadline - time.time()))
+            if line.startswith("info") and " depth " in line:
+                toks = line.split()
+                try:
+                    d = int(toks[toks.index("depth") + 1])
+                    # Ignore depth from "currmove"-only lines etc; a normal
+                    # PV info line's depth is monotonically non-decreasing,
+                    # so just track the max seen.
+                    last_depth = max(last_depth, d)
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                move = parts[1] if len(parts) > 1 else "(none)"
+                return move, last_depth
+        raise TimeoutError(f"{self.path}: 'bestmove' not seen within {timeout_s}s")
 
     def set_multipv(self, k, timeout_s=10.0):
         self.send(f"setoption name MultiPV value {k}")
@@ -212,6 +229,69 @@ class Engine:
         if not candidates:
             return bestmove
         return random.choice(list(candidates.values()))
+
+    def get_fen(self, moves, timeout_s=10.0):
+        """Uses Pikafish's 'd' debug command (prints 'Fen: <fen>' among other
+        info) to get the FEN for the current position, without needing our
+        own Xiangqi board implementation. 'd' has no completion marker of
+        its own, so we follow it with 'isready' and collect everything up
+        to 'readyok' -- readyok is guaranteed to come after all of 'd's
+        output has been flushed, per the UCI protocol's synchronous
+        command handling."""
+        pos_cmd = "position startpos"
+        if moves:
+            pos_cmd += " moves " + " ".join(moves)
+        self.send(pos_cmd)
+        self.send("d")
+        self.send("isready")
+        fen = None
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            line = self.readline(timeout=max(0.1, deadline - time.time()))
+            if line.startswith("Fen:"):
+                fen = line[len("Fen:"):].strip()
+            elif "readyok" in line:
+                break
+        return fen
+
+    def go_until_depth_or_timeout(self, fen, min_depth, max_time_s):
+        """Analyzes a position given directly as a FEN (not a move list --
+        used for standalone book-building on arbitrary positions). Sends a
+        generous 'go movetime <max_time_s>' as an upper bound, but sends the
+        real UCI 'stop' command the moment depth >= min_depth is seen,
+        ending the search early instead of always waiting the full budget.
+        This implements "depth phải đạt từ 30 trở lên HOẶC tối đa 5 phút cho
+        thế cờ khó": whichever condition is met first ends the analysis,
+        and whatever depth/move was reached by then is returned -- for a
+        genuinely hard position that never reaches depth 30 even after the
+        full 5 minutes, we still return its best result; deciding whether
+        that's "good enough" is left to the caller.
+
+        Returns (move, depth_reached, elapsed_seconds)."""
+        self.send(f"position fen {fen}")
+        self.send(f"go movetime {int(max_time_s * 1000)}")
+        last_depth = 0
+        move = "(none)"
+        stopped_early = False
+        t0 = time.time()
+        deadline = t0 + max_time_s + 30  # hard safety margin beyond the engine's own movetime
+        while time.time() < deadline:
+            line = self.readline(timeout=max(0.1, deadline - time.time()))
+            if line.startswith("info") and " depth " in line:
+                toks = line.split()
+                try:
+                    d = int(toks[toks.index("depth") + 1])
+                    last_depth = max(last_depth, d)
+                    if last_depth >= min_depth and not stopped_early:
+                        self.send("stop")
+                        stopped_early = True
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                move = parts[1] if len(parts) > 1 else "(none)"
+                break
+        return move, last_depth, time.time() - t0
 
     def quit(self):
         try:
@@ -291,40 +371,161 @@ def looks_repetitive(moves, window=8, repeats=3):
     return all(tail[i * window:(i + 1) * window] == block for i in range(repeats))
 
 
-def generate_opening(engine, plies, multipv, movetime_ms, timeout_s):
-    """Generates a single random opening sequence (list of UCI moves) using
-    ONE engine's own top-K MultiPV candidates at each ply, picked randomly.
-    Used to create a SHARED opening for a "paired" pair of games (see
-    play_pair below) -- fishtest's standard technique: play the identical
-    opening twice with colors swapped, which cancels out most of the
-    opening's own bias toward one side, so far fewer total games are needed
-    to see a real strength difference than with independent random openings
-    per game."""
-    engine.new_game()
+CDB_URL = "http://www.chessdb.cn/chessdb.php"
+
+
+def cdb_query_move(fen, timeout=5.0, prefer_random=True):
+    """Queries chessdb.cn's Xiangqi Cloud Database for a book move at this
+    position. Uses action=query (documented as returning a best/random/
+    candidate move -- gives natural opening variety) rather than querybest
+    (always the single best line), since we want diverse openings, not the
+    same main line every time.
+
+    NOTE (being upfront about a real limitation): this exact HTTP call could
+    not be tested end-to-end from the sandbox this script was written in
+    (no network route to chessdb.cn there). The request/response format
+    below follows chessdb.cn's own published API docs
+    (https://www.chessdb.cn/cloudbook_api_en.html) plus a working community
+    script referencing the same endpoint, but you should sanity-check it
+    once for real before trusting it in a long unattended run, e.g.:
+        python3 -c "from pika_match import cdb_query_move as q; print(q('rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1'))"
+
+    Returns a UCI move string, or None if CDB has no book data for this
+    position (out of book / unknown / error) -- caller should fall back to
+    its own move generation in that case.
+    """
+    action = "query" if prefer_random else "querybest"
+    url = f"{CDB_URL}?action={action}&board={urllib.parse.quote(fen)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None  # network hiccup / CDB down -- just fall back, never crash the run
+
+    # Documented replies: "move:XXXX", "egtb:XXXX", "search:XXXX" (candidate,
+    # needs further engine processing -- we treat it as unusable here),
+    # "unknown", "nobestmove", "invalid board".
+    if text.startswith("move:") or text.startswith("egtb:"):
+        return text.split(":", 1)[1].split(",")[0].strip()
+    return None
+
+
+def cdb_query_egtb_move(fen, timeout=5.0):
+    """Queries CDB specifically for an EXACT endgame-tablebase (EGTB) move --
+    NOT a regular cloud-analyzed move. This distinction matters: an "egtb:"
+    reply is mathematically PROVEN correct (solved, not just deeply
+    searched), so it's trustworthy regardless of what "depth" would even
+    mean for it -- unlike a plain "move:" reply, which CDB's API does NOT
+    report a depth for, so we have no honest basis to claim it meets a
+    depth>=30 bar. Used by build_book.py as a free shortcut: skip the
+    expensive local 5-minute analysis whenever CDB already has a proven
+    endgame answer for this exact position.
+
+    Returns a UCI move string, or None if CDB has no EGTB data here (very
+    common outside actual reduced-material endgames -- that's expected, not
+    an error, caller should fall back to local analysis)."""
+    url = f"{CDB_URL}?action=querybest&board={urllib.parse.quote(fen)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None
+    if text.startswith("egtb:"):
+        return text.split(":", 1)[1].split(",")[0].strip()
+    return None
+
+
+def desktop_book_path(filename):
+    home = os.environ.get("USERPROFILE") if os.name == "nt" else os.environ.get("HOME")
+    return os.path.join(home or ".", "Desktop", filename)
+
+
+def append_to_obk(path, fen, move, depth, source_tag):
+    """Appends one qualifying (fen, move) pair to the .obk book file,
+    deduped by FEN -- if this exact position is already in the book, skip
+    it (matches the "don't log duplicates" rule used for the other logs in
+    this project). Reads the whole file to check for dupes each time, which
+    is fine for a book file meant to stay at most tens of thousands of
+    lines; not meant for huge-scale book building."""
+    fen_key = fen.split(" - ")[0]  # ignore halfmove/fullmove counters when deduping
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith(f"fen={fen_key}"):
+                        return False  # already known, skip
+    except Exception:
+        pass
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"fen={fen} move={move} depth={depth} source={source_tag}\n")
+        return True
+    except Exception:
+        return False
+
+
+def generate_opening(engine, plies, multipv, movetime_ms, timeout_s, use_cdb=True):
+    """Generates a single opening sequence (list of UCI moves), preferring
+    REAL online book moves from chessdb.cn (the Xiangqi Cloud Database) when
+    available, falling back to the engine's own random top-K MultiPV choice
+    once CDB has no data for the position (i.e. once we're out of book).
+
+    Returns (moves, cdb_plies) where cdb_plies is how many of the leading
+    moves came from CDB -- the caller uses this to know where "book" ends
+    and "the engine's own play" begins, which matters for deciding which
+    positions are even eligible to be logged into the local .obk file (only
+    positions reached AFTER leaving book should be logged -- see main())."""
+    engine.new_game(timeout_s=timeout_s)
     if multipv > 1:
         engine.set_multipv(multipv, timeout_s=timeout_s)
+
     moves = []
+    cdb_plies = 0
+    still_in_cdb_book = use_cdb
     for ply in range(plies):
-        move = engine.go_and_get_random_opening_move(moves, movetime_ms, timeout_s, multipv)
+        move = None
+        if still_in_cdb_book:
+            fen = engine.get_fen(moves, timeout_s=timeout_s)
+            move = cdb_query_move(fen, timeout=5.0) if fen else None
+            if move is None:
+                still_in_cdb_book = False  # out of CDB's book from here on
+            else:
+                cdb_plies = ply + 1
+
+        if move is None:
+            move = engine.go_and_get_random_opening_move(moves, movetime_ms, timeout_s, multipv)
+
         if move == "(none)":
             break  # got mated inside the "opening" -- just use what we have
         moves.append(move)
+
     if multipv > 1:
         engine.set_multipv(1, timeout_s=timeout_s)
-    return moves
+    return moves, cdb_plies
 
 
 def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s,
-               opening_moves=None):
+               opening_moves=None, obk_path=None, obk_min_depth=30, candidates_path=None):
     """red_engine moves first (Red always opens in Xiangqi). Returns
     (result, plies, reason) where result is 'red', 'black', or 'draw'.
 
     opening_moves: an optional pre-generated move sequence (see
     generate_opening) that both engines are seeded with before real play
     starts. Passing the SAME sequence into two calls (with red/black
-    swapped) is what "paired openings" means."""
-    red_engine.new_game()
-    black_engine.new_game()
+    swapped) is what "paired openings" means.
+
+    obk_path: if set, every REAL move (i.e. after the opening phase -- book
+    moves and random-diversity opening moves are never logged, only the
+    engine's own independently-searched middlegame/endgame moves) that
+    reached depth >= obk_min_depth at this game's movetime is appended to
+    the .obk file directly. Moves that DIDN'T reach that depth (very likely
+    at normal test movetimes -- depth 30 usually needs much longer thinking)
+    are instead appended to candidates_path as {fen, move} pairs for a
+    SEPARATE, slower deep-analysis pass (see build_book.py) that can spend
+    up to several minutes per position -- doing that inline here would make
+    every test match agonizingly slow."""
+    red_engine.new_game(timeout_s=move_timeout_s)
+    black_engine.new_game(timeout_s=move_timeout_s)
 
     moves = list(opening_moves) if opening_moves else []
     start_ply = len(moves)
@@ -334,13 +535,24 @@ def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s,
 
     for ply in range(start_ply, max_plies):
         mover = red_engine if ply % 2 == 0 else black_engine
-        move = mover.go_and_get_move(moves, movetime_ms, move_timeout_s)
+
+        fen_before = None
+        if obk_path and mover.is_alive():
+            fen_before = mover.get_fen(moves, timeout_s=move_timeout_s)
+
+        move, depth = mover.go_and_get_move(moves, movetime_ms, move_timeout_s)
 
         if move == "(none)":
             # Side to move has no legal move => that side loses (Xiangqi has
             # no stalemate-draw rule: no legal move is always a loss).
             loser_is_red = (ply % 2 == 0)
             return ("black" if loser_is_red else "red"), ply, "no_legal_move"
+
+        if obk_path and fen_before:
+            if depth >= obk_min_depth:
+                append_to_obk(obk_path, fen_before, move, depth, os.path.basename(mover.path))
+            elif candidates_path:
+                append_to_obk(candidates_path, fen_before, move, depth, os.path.basename(mover.path))
 
         moves.append(move)
 
@@ -367,6 +579,21 @@ def main():
     ap.add_argument("--opening-movetime", type=int, default=100,
                      help="ms per move during the opening phase (kept short -- these moves don't "
                           "need to be deep, just legal and reasonable).")
+    ap.add_argument("--use-cdb", action="store_true",
+                     help="Prefer real book moves from chessdb.cn (Xiangqi Cloud Database) during "
+                          "the opening phase over the engine's own random MultiPV pick, falling "
+                          "back automatically once CDB has no data for a position.")
+    ap.add_argument("--obk-path", default="",
+                     help="If set, real (post-opening) moves that reach --obk-min-depth are logged "
+                          "here in .obk format -- a growing book of high-confidence middlegame/"
+                          "endgame moves from actual self-play, deduped by position.")
+    ap.add_argument("--obk-min-depth", type=int, default=30,
+                     help="Minimum search depth for a move to qualify for direct .obk logging.")
+    ap.add_argument("--obk-candidates-path", default="",
+                     help="Where to queue positions whose move didn't reach --obk-min-depth at "
+                          "test movetime -- feed this file to build_book.py for a separate, slower "
+                          "deep-analysis pass (up to several minutes per position) that promotes "
+                          "qualifying ones into --obk-path.")
     ap.add_argument("--move-timeout", type=float, default=30.0,
                      help="Seconds to wait for a single bestmove before aborting the game")
     ap.add_argument("--e1-options", default="", help="e.g. Contempt=0,MaxThinkTime=30000")
@@ -418,9 +645,12 @@ def main():
             if args.opening_plies > 0:
                 if g % 2 == 0:
                     try:
-                        current_opening = generate_opening(
+                        current_opening, cdb_plies = generate_opening(
                             e1, args.opening_plies, args.opening_multipv,
-                            args.opening_movetime, args.move_timeout)
+                            args.opening_movetime, args.move_timeout, use_cdb=args.use_cdb)
+                        if cdb_plies:
+                            print(f"[game {g}] opening: {cdb_plies}/{len(current_opening)} "
+                                  f"plies from chessdb.cn book")
                     except (TimeoutError, ConnectionError) as exc:
                         print(f"[game {g}] opening generation failed ({exc}), using empty opening")
                         current_opening = []
@@ -432,7 +662,9 @@ def main():
             try:
                 result, plies, reason = play_game(
                     red, black, args.movetime, args.max_plies, args.move_timeout,
-                    opening_moves=current_opening)
+                    opening_moves=current_opening,
+                    obk_path=(args.obk_path or None), obk_min_depth=args.obk_min_depth,
+                    candidates_path=(args.obk_candidates_path or None))
             except (TimeoutError, ConnectionError) as exc:
                 print(f"[game {g}] ABORTED: {exc}")
                 result, plies, reason = "aborted", 0, f"aborted:{exc}"

@@ -189,7 +189,7 @@ jobs:
             --engine patched/src/pikafish \
             --candidates book/pikafish_book_candidates.obk \
             --obk book/pikafish_book.obk \
-            --min-depth 30 --max-time 300 \
+            --min-depth 30 --max-time 300 --use-cdb \
             --limit "${{ github.event.inputs.promote_candidates }}"
 
       - name: Commit updated book back to this repo
