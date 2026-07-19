@@ -1,8 +1,8 @@
 diff --git a/src/engine.cpp b/src/engine.cpp
-index 98945ceb..d876fde5 100644
+index 93792b75..56986741 100644
 --- a/src/engine.cpp
 +++ b/src/engine.cpp
-@@ -101,6 +101,32 @@ Engine::Engine(std::optional<std::string> path) :
+@@ -105,6 +105,32 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
  
      options.add("Move Overhead", Option(10, 0, 5000));
  
@@ -36,10 +36,10 @@ index 98945ceb..d876fde5 100644
  
      options.add("UCI_ShowWDL", Option(false));
 diff --git a/src/movepick.cpp b/src/movepick.cpp
-index 011b1ffc..c4387581 100644
+index 46d66395..082b9a08 100644
 --- a/src/movepick.cpp
 +++ b/src/movepick.cpp
-@@ -29,6 +29,13 @@ namespace Stockfish {
+@@ -30,6 +30,13 @@ namespace Stockfish {
  
  namespace {
  
@@ -53,7 +53,7 @@ index 011b1ffc..c4387581 100644
  enum Stages {
      // generate main search moves
      MAIN_TT,
-@@ -221,9 +228,38 @@ ExtMove* MovePicker::score(const MoveList<Type>& ml) {
+@@ -222,9 +229,38 @@ ExtMove* MovePicker::score(const MoveList<Type>& ml) {
          const Piece     capturedPiece = pos.piece_on(to);
  
          if constexpr (Type == CAPTURES)
@@ -93,7 +93,7 @@ index 011b1ffc..c4387581 100644
          {
              // histories
 diff --git a/src/search.cpp b/src/search.cpp
-index ed129af7..15144b53 100644
+index 68d3a74d..6a6198ce 100644
 --- a/src/search.cpp
 +++ b/src/search.cpp
 @@ -25,6 +25,9 @@
@@ -105,10 +105,10 @@ index ed129af7..15144b53 100644
 +#include <unordered_map>
  #include <initializer_list>
  #include <string>
- #include <tuple>
-@@ -56,6 +59,90 @@ namespace {
+ #include <utility>
+@@ -53,6 +56,90 @@ using namespace Search;
  
- constexpr uint64_t NODES_LIMIT_OUTPUT = 10'000'000;
+ namespace {
  
 +// Shared helper for resolving <home>/Desktop/<name>, used by both the
 +// blind-spot log and the learned-mistakes store so they stay consistent
@@ -194,18 +194,18 @@ index ed129af7..15144b53 100644
 +        out << std::hex << key << ' ' << m.raw() << std::dec << '\n';
 +}
 +
- constexpr int SEARCHEDLIST_CAPACITY = 32;
- using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
+ constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
  
-@@ -260,6 +347,7 @@ bool Search::Worker::iterative_deepening() {
-     Value  bestValue          = -VALUE_INFINITE;
-     Value  lastIterationScore = -VALUE_INFINITE;
-     Color  us                 = rootPos.side_to_move();
-+    rootColor                 = us;
+ constexpr int SEARCHEDLIST_CAPACITY = 32;
+@@ -261,6 +348,7 @@ bool Search::Worker::iterative_deepening() {
+     Value  alpha, beta;
+     Value  bestValue     = -VALUE_INFINITE;
+     Color  us            = rootPos.side_to_move();
++    rootColor            = us;
      double timeReduction = 1, totBestMoveChanges = 0;
      int    delta, iterIdx                        = 0;
  
-@@ -294,6 +382,20 @@ bool Search::Worker::iterative_deepening() {
+@@ -295,6 +383,20 @@ bool Search::Worker::iterative_deepening() {
  
      multiPV = std::min(multiPV, rootMoves.size());
  
@@ -226,7 +226,7 @@ index ed129af7..15144b53 100644
      int  searchAgainCounter = 0;
      bool uciPvSent          = false;
  
-@@ -339,9 +441,16 @@ bool Search::Worker::iterative_deepening() {
+@@ -346,9 +448,16 @@ bool Search::Worker::iterative_deepening() {
              alpha     = std::max(avg - delta, -VALUE_INFINITE);
              beta      = std::min(avg + delta, VALUE_INFINITE);
  
@@ -246,12 +246,12 @@ index ed129af7..15144b53 100644
  
              // Start with a small aspiration window and, in the case of a fail
              // high/low, re-search with a bigger window until we don't fail
-@@ -438,8 +547,41 @@ bool Search::Worker::iterative_deepening() {
-                                 && (std::abs(rootMoves[0].score) < std::abs(lastIterationScore)
+@@ -475,8 +584,41 @@ bool Search::Worker::iterative_deepening() {
+                                 && (std::abs(rootMoves[0].score) < std::abs(lastBestMoveScore)
                                      || rootMoves[0].score_is_bound());
  
 +        // Root score regression ("blind spot") detection: the previous
-+        // iteration found lastIterationScore; if what we now believe is best
++        // iteration found lastBestMoveScore; if what we now believe is best
 +        // just dropped sharply, a shallower search (the kind a time budget
 +        // can be cut off at) would have been fooled. Detected unconditionally
 +        // (main thread only) -- BlindSpotLog/LearnFromMistakes below only
@@ -264,31 +264,31 @@ index ed129af7..15144b53 100644
          if (!threads.stop)
          {
 +            const bool regressed =
-+              is_mainthread() && rootDepth >= 6 && lastIterationScore != -VALUE_INFINITE
-+              && !is_decisive(lastIterationScore) && !is_decisive(rootMoves[0].score)
-+              && lastIterationScore - rootMoves[0].score >= RegressionThreshold;
++              is_mainthread() && rootDepth >= 6 && lastBestMoveScore != -VALUE_INFINITE
++              && !is_decisive(lastBestMoveScore) && !is_decisive(rootMoves[0].score)
++              && lastBestMoveScore - rootMoves[0].score >= RegressionThreshold;
 +
 +            if (regressed)
 +            {
 +                regressionExtend = true;
 +
 +                if (options["BlindSpotLog"])
-+                    log_blind_spot(rootPos, rootDepth, lastIterationScore, rootMoves[0].score,
++                    log_blind_spot(rootPos, rootDepth, lastBestMoveScore, rootMoves[0].score,
 +                                    rootMoves[0].pv[0]);
 +
 +                // Remember the move that WAS considered best a moment ago, if
 +                // a different move has since taken over -- the concrete
 +                // "looked good but wasn't" lesson worth avoiding if this
 +                // exact position recurs (see is_learned_bad() usage above).
-+                if (options["LearnFromMistakes"] && !lastIterationPV.empty()
-+                    && rootMoves[0].pv[0] != lastIterationPV[0])
-+                    remember_bad_move(rootPos.key(), lastIterationPV[0]);
++                if (options["LearnFromMistakes"] && !lastBestMovePV.empty()
++                    && rootMoves[0].pv[0] != lastBestMovePV[0])
++                    remember_bad_move(rootPos.key(), lastBestMovePV[0]);
 +            }
 +
-             if (lastIterationPV.empty() || rootMoves[0].pv[0] != lastIterationPV[0])
+             if (lastBestMovePV.empty() || lastBestMovePV[0] != rootMoves[0].pv[0])
                  lastBestMoveDepth = rootDepth;
  
-@@ -520,10 +662,27 @@ bool Search::Worker::iterative_deepening() {
+@@ -554,9 +696,26 @@ bool Search::Worker::iterative_deepening() {
              double totalTime = mainThread->tm.optimum() * fallingEval * reduction
                               * bestMoveInstability * highBestMoveEffort;
  
@@ -301,7 +301,6 @@ index ed129af7..15144b53 100644
 +            if (regressionExtend)
 +                totalTime *= 1.5;
 +
-             // Cap used time in case of a single legal move for a better viewer experience
              if (rootMoves.size() == 1)
                  threads.stop = true;
  
@@ -310,13 +309,13 @@ index ed129af7..15144b53 100644
 +            // at least one extra depth (guards against a same-depth mate
 +            // mirage), stop immediately instead of spending the rest of the
 +            // optimum/maximum time budget on it.
-+            if (is_decisive(bestValue) && rootDepth >= lastBestMoveDepth + 2)
++            if (is_decisive(rootMoves[0].score) && rootDepth >= lastBestMoveDepth + 2)
 +                threads.stop = true;
 +
              auto elapsedTime = elapsed();
  
-             // Stop the search if we have exceeded the totalTime or maximum
-@@ -680,7 +839,28 @@ Value Search::Worker::search(
+             // Stop the search if we have exceeded totalTime or maximum time,
+@@ -719,7 +878,28 @@ Value Search::Worker::search(
          // Step 2. Check for aborted search and repetition
          Value result = VALUE_NONE;
          if (pos.rule_judge(result, ss->ply))
@@ -347,10 +346,10 @@ index ed129af7..15144b53 100644
          {
              assert(result != VALUE_DRAW);
 diff --git a/src/search.h b/src/search.h
-index 1bcf3695..72527d74 100644
+index 1d780d85..b7e4f7e3 100644
 --- a/src/search.h
 +++ b/src/search.h
-@@ -364,6 +364,12 @@ class Worker {
+@@ -365,6 +365,12 @@ class Worker {
      // The main thread has a SearchManager, the others have a NullSearchManager
      std::unique_ptr<ISearchManager> manager;
  
@@ -364,10 +363,10 @@ index 1bcf3695..72527d74 100644
      ThreadPool&                                              threads;
      TranspositionTable&                                      tt;
 diff --git a/src/timeman.cpp b/src/timeman.cpp
-index 9a55f57c..caa5b9a9 100644
+index 68eadf74..3867392c 100644
 --- a/src/timeman.cpp
 +++ b/src/timeman.cpp
-@@ -134,6 +134,18 @@ void TimeManagement::init(Search::LimitsType& limits,
+@@ -132,6 +132,18 @@ void TimeManagement::init(Search::LimitsType& limits,
  
      if (options["Ponder"])
          optimumTime += optimumTime / 4;

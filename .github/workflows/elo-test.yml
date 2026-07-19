@@ -32,7 +32,13 @@ env:
   # instrumented, chạy benchmark lấy profile, rồi build lại lần 2).
   PIKAFISH_ARCH: x86-64-universal
   PIKAFISH_COMP: clang
-  BASE_COMMIT: 8ab92480b3b270bb7271910585acd4cc148da80b
+  # Chốt ở commit MỚI NHẤT (cùng thời điểm với master-net hiện tại) thay vì
+  # commit cũ 8ab92480 -- lý do: master-net trên GitHub Releases là 1 tag
+  # BỊ GHI ĐÈ liên tục, không giữ lịch sử. Pin vào commit cũ + luôn tải net
+  # mới nhất gây lệch phiên bản (network không load được -- xem issue #130
+  # của chính dự án Pikafish, cùng triệu chứng). Patch đã được port lại để
+  # áp đúng lên commit này.
+  BASE_COMMIT: 7c09ec2578c3b7a48ce4ee5cd067971ef9c4c320
   PIKAFISH_REPO: https://github.com/official-pikafish/Pikafish.git
 
 jobs:
