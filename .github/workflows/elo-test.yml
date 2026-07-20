@@ -111,19 +111,22 @@ jobs:
 
       - name: Smoke test both binaries actually SEARCH (not just handshake)
         run: |
-          # Lỗi lần trước xảy ra trong generate_opening() (lệnh 'd' lấy FEN +
-          # 'setoption MultiPV' + go) -- bước smoke test CŨ chỉ test 'go' đơn
-          # giản, không test đúng chuỗi lệnh này nên không bắt được. Bước mới
-          # gửi ĐÚNG chuỗi lệnh thật generate_opening() dùng, in TOÀN BỘ
-          # output thẳng ra log chính VÀ GitHub Step Summary.
+          # Lần trước: 1 lần gọi d/setoption/go thì OK, nhưng ván thật vẫn
+          # crash -- nghi vấn là lỗi chỉ lộ ra khi LẶP LẠI nhiều lần (mỗi
+          # nước khai cuộc gọi 'd' 1 lần, mặc định 8 nước). Bước này lặp lại
+          # đúng 8 lần để bắt đúng kiểu lỗi đó, thay vì chỉ gọi 1 lần.
           set +e
-          echo "## 🔍 Search smoke test" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🔍 Search smoke test (repeated d/go x8, như generate_opening thật)" >> "$GITHUB_STEP_SUMMARY"
+          CMDS="uci\nisready\nucinewgame\nsetoption name MultiPV value 4\nisready"
+          for i in 1 2 3 4 5 6 7 8; do
+            CMDS="${CMDS}\nposition startpos\nd\nisready\ngo movetime 100"
+          done
+          CMDS="${CMDS}\nquit"
           for tag in base patched; do
             echo "===== $tag/src/pikafish ====="
-            OUTPUT=$(cd "$tag/src" && printf 'uci\nisready\nucinewgame\nposition startpos\nd\nisready\nsetoption name MultiPV value 4\nisready\ngo movetime 500\nquit\n' \
-              | ./pikafish 2>&1)
+            OUTPUT=$(cd "$tag/src" && printf '%b\n' "$CMDS" | ./pikafish 2>&1)
             code=$?
-            echo "$OUTPUT"
+            echo "$OUTPUT" | tail -40
             echo "===== $tag exit code: $code ====="
             if [ $code -ne 0 ]; then
               # exit code = 128 + signal number khi process bị OS kill. Các mã
