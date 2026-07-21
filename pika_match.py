@@ -475,9 +475,14 @@ def generate_opening(engine, plies, multipv, movetime_ms, timeout_s, use_cdb=Tru
     and "the engine's own play" begins, which matters for deciding which
     positions are even eligible to be logged into the local .obk file (only
     positions reached AFTER leaving book should be logged -- see main())."""
+    print(f"  [opening-dbg] new_game() on {engine.path} ...")
     engine.new_game(timeout_s=timeout_s)
+    print(f"  [opening-dbg] new_game() ok")
+
     if multipv > 1:
+        print(f"  [opening-dbg] set_multipv({multipv}) ...")
         engine.set_multipv(multipv, timeout_s=timeout_s)
+        print(f"  [opening-dbg] set_multipv ok")
 
     moves = []
     cdb_plies = 0
@@ -485,15 +490,21 @@ def generate_opening(engine, plies, multipv, movetime_ms, timeout_s, use_cdb=Tru
     for ply in range(plies):
         move = None
         if still_in_cdb_book:
+            print(f"  [opening-dbg] ply {ply}: get_fen() ...")
             fen = engine.get_fen(moves, timeout_s=timeout_s)
+            print(f"  [opening-dbg] ply {ply}: get_fen ok, fen={fen!r}")
+            print(f"  [opening-dbg] ply {ply}: cdb_query_move() ...")
             move = cdb_query_move(fen, timeout=5.0) if fen else None
+            print(f"  [opening-dbg] ply {ply}: cdb_query_move ok, move={move!r}")
             if move is None:
                 still_in_cdb_book = False  # out of CDB's book from here on
             else:
                 cdb_plies = ply + 1
 
         if move is None:
+            print(f"  [opening-dbg] ply {ply}: go_and_get_random_opening_move() ...")
             move = engine.go_and_get_random_opening_move(moves, movetime_ms, timeout_s, multipv)
+            print(f"  [opening-dbg] ply {ply}: go_and_get_random_opening_move ok, move={move!r}")
 
         if move == "(none)":
             break  # got mated inside the "opening" -- just use what we have
