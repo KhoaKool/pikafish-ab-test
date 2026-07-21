@@ -93,6 +93,7 @@ class Engine:
         # into the folder and runs the exe by hand.
         engine_dir = os.path.dirname(os.path.abspath(self.path)) or "."
         engine_exe = os.path.abspath(self.path)
+        self.engine_dir = engine_dir
         self.proc = subprocess.Popen(
             [engine_exe],
             stdin=subprocess.PIPE,
@@ -105,7 +106,22 @@ class Engine:
         self.q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        self._handshake(self.options)
+
+        # Belt-and-suspenders fix for a real, recurring issue: Pikafish's own
+        # directory-auto-detection for the default NNUE file has changed
+        # across versions and isn't always reliable from every cwd/argv0
+        # combination (see official-pikafish/Pikafish issue #29 -- same
+        # exact "was not loaded successfully" message reported by others).
+        # The engine's OWN error message says exactly what to do: "might
+        # need to specify the full path" -- so we just always do that
+        # automatically, unless the caller already explicitly set EvalFile.
+        opts = dict(self.options)
+        if "EvalFile" not in opts:
+            default_nnue = os.path.join(engine_dir, "pikafish.nnue")
+            if os.path.exists(default_nnue):
+                opts["EvalFile"] = default_nnue
+
+        self._handshake(opts)
 
     def is_alive(self):
         return self.proc.poll() is None

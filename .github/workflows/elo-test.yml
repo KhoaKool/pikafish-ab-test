@@ -111,32 +111,37 @@ jobs:
 
       - name: Smoke test both binaries actually SEARCH (not just handshake)
         run: |
-          # Lần trước: 1 lần gọi d/setoption/go thì OK, nhưng ván thật vẫn
-          # crash -- nghi vấn là lỗi chỉ lộ ra khi LẶP LẠI nhiều lần (mỗi
-          # nước khai cuộc gọi 'd' 1 lần, mặc định 8 nước). Bước này lặp lại
-          # đúng 8 lần để bắt đúng kiểu lỗi đó, thay vì chỉ gọi 1 lần.
+          # Lần trước: engine tự báo "network file was not loaded successfully"
+          # dù file .nnue tồn tại đúng chỗ, đúng kích thước -- cơ chế tự dò
+          # thư mục binary đã đổi giữa các bản Pikafish và không phải lúc nào
+          # cũng đáng tin. Theo đúng gợi ý của chính engine ("might need to
+          # specify the full path"), giờ set EvalFile bằng đường dẫn TUYỆT ĐỐI
+          # tường minh thay vì để engine tự đoán.
           set +e
           echo "## 🔍 Search smoke test (repeated d/go x8, như generate_opening thật)" >> "$GITHUB_STEP_SUMMARY"
-          CMDS="uci\nisready\nucinewgame\nsetoption name MultiPV value 4\nisready"
-          for i in 1 2 3 4 5 6 7 8; do
-            CMDS="${CMDS}\nposition startpos\nd\nisready\ngo movetime 100"
-          done
-          CMDS="${CMDS}\nquit"
           for tag in base patched; do
             echo "===== $tag/src/pikafish ====="
+            ABS_NNUE="$GITHUB_WORKSPACE/$tag/src/pikafish.nnue"
+            CMDS="uci\nsetoption name EvalFile value ${ABS_NNUE}\nisready\nucinewgame\nsetoption name MultiPV value 4\nisready"
+            for i in 1 2 3 4 5 6 7 8; do
+              CMDS="${CMDS}\nposition startpos\nd\nisready\ngo movetime 100"
+            done
+            CMDS="${CMDS}\nquit"
             OUTPUT=$(cd "$tag/src" && printf '%b\n' "$CMDS" | ./pikafish 2>&1)
             code=$?
             echo "$OUTPUT" | tail -40
             echo "===== $tag exit code: $code ====="
             if [ $code -ne 0 ]; then
-              # exit code = 128 + signal number khi process bị OS kill. Các mã
-              # hay gặp: 134=SIGABRT (assert/abort), 139=SIGSEGV (segfault,
-              # lỗi bộ nhớ), 137=SIGKILL (thường do OOM killer giết vì hết RAM).
+              # exit code = 128 + signal number CHỈ khi process bị OS kill
+              # (segfault/OOM). exit 1 thường là engine TỰ thoát có chủ đích
+              # (ví dụ báo lỗi network) chứ không phải bị kill -- không suy
+              # ra tên tín hiệu bừa cho trường hợp này.
               case $code in
+                1) SIGNAME="engine tự thoát (exit 1) -- đọc output phía trên để biết lý do thật, KHÔNG phải bị OS kill" ;;
                 134) SIGNAME="SIGABRT (assert()/abort() trong code -- thường có message ở trên)" ;;
-                139) SIGNAME="SIGSEGV (segfault -- lỗi truy cập bộ nhớ, KHÔNG có message, đúng như stderr rỗng bạn gặp)" ;;
+                139) SIGNAME="SIGSEGV (segfault -- lỗi truy cập bộ nhớ, KHÔNG có message)" ;;
                 137) SIGNAME="SIGKILL (rất có thể bị OOM killer giết vì hết RAM -- cũng KHÔNG có message)" ;;
-                *) SIGNAME="mã tín hiệu $((code - 128))" ;;
+                *) SIGNAME="mã thoát $code (>128 thường = signal $((code - 128)), nếu không thì engine tự thoát có chủ đích)" ;;
               esac
               echo "!!! $tag/src/pikafish CRASHED: $SIGNAME"
               {
