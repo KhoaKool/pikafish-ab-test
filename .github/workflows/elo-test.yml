@@ -9,7 +9,7 @@ on:
       patch_file:
         description: "Đường dẫn file .patch trong repo này"
         required: true
-        default: "patches/pikafish-aggro-HEAD-v2.patch"
+        default: "patches/pikafish-aggro-HEAD-v3.patch"
       games:
         description: "Số ván"
         required: false
@@ -46,7 +46,12 @@ env:
   # mới nhất gây lệch phiên bản (network không load được -- xem issue #130
   # của chính dự án Pikafish, cùng triệu chứng). Patch đã được port lại để
   # áp đúng lên commit này.
-  BASE_COMMIT: 7c09ec2578c3b7a48ce4ee5cd067971ef9c4c320
+  # Cập nhật 21/7/2026: commit 52c1e717 (20/7/2026) đổi FullThreats::HashValue
+  # (0x8f234cb8 -> 0x2e6b9d04), khiến master-net mới không load được trên
+  # commit pin cũ (7c09ec25) -- đã xác nhận bằng cách tự tải + giải nén +
+  # đối chiếu version/hash header thật, không phải đoán. Pin mới đã bao gồm
+  # fix này.
+  BASE_COMMIT: 97133eebb6ed55e0bfa13262555c77d683d6ac0f
   PIKAFISH_REPO: https://github.com/official-pikafish/Pikafish.git
 
 jobs:
