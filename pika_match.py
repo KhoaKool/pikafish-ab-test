@@ -388,6 +388,24 @@ def looks_repetitive(moves, window=8, repeats=3):
 
 
 CDB_URL = "http://www.chessdb.cn/chessdb.php"
+_UCI_MOVE_RE = re.compile(r"^[a-i][0-9][a-i][0-9]$")
+
+
+def _sanitize_cdb_move(raw):
+    """Cleans a move token extracted from a CDB response and validates it
+    looks like a real Xiangqi UCI move (file a-i, rank 0-9, x4 chars).
+
+    Why this exists: CDB responses have been observed to contain a stray
+    trailing NUL byte (\\x00) that Python's str.strip() does NOT remove
+    (NUL is not whitespace), so a naive .strip() lets a corrupted token
+    like 'd0e1\\x00' through -- which then gets written straight into the
+    engine's stdin via `position ... moves d0e1\\x00 ...` and crashes it.
+    Strip control/non-printable chars explicitly, then validate format;
+    reject (return None) rather than trust anything that doesn't match."""
+    if raw is None:
+        return None
+    cleaned = "".join(ch for ch in raw if ch.isprintable()).strip()
+    return cleaned if _UCI_MOVE_RE.fullmatch(cleaned) else None
 
 
 def cdb_query_move(fen, timeout=5.0, prefer_random=True):
@@ -422,7 +440,7 @@ def cdb_query_move(fen, timeout=5.0, prefer_random=True):
     # needs further engine processing -- we treat it as unusable here),
     # "unknown", "nobestmove", "invalid board".
     if text.startswith("move:") or text.startswith("egtb:"):
-        return text.split(":", 1)[1].split(",")[0].strip()
+        return _sanitize_cdb_move(text.split(":", 1)[1].split(",")[0])
     return None
 
 
@@ -447,7 +465,7 @@ def cdb_query_egtb_move(fen, timeout=5.0):
     except Exception:
         return None
     if text.startswith("egtb:"):
-        return text.split(":", 1)[1].split(",")[0].strip()
+        return _sanitize_cdb_move(text.split(":", 1)[1].split(",")[0])
     return None
 
 
