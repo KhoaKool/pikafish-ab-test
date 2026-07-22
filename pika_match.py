@@ -651,6 +651,21 @@ def main():
                           "(0.0-1.0) -- lets a CI job fail visibly when the patch looks worse")
     args = ap.parse_args()
 
+    # Sanity check found the hard way: --move-timeout is how long the harness
+    # waits for a SINGLE bestmove; --movetime is how long we TELL the engine
+    # to think per move. If move-timeout <= movetime, every real move will
+    # look like a crash/hang ("no response within Xs") even though the
+    # engine is behaving exactly as instructed -- it's just still thinking
+    # when the harness gives up on it. Require a real safety margin (IPC/UCI
+    # overhead, slow CI runners) rather than just movetime itself.
+    movetime_s = args.movetime / 1000.0
+    min_required = movetime_s + 10.0
+    if args.move_timeout < min_required:
+        ap.error(f"--move-timeout ({args.move_timeout}s) is too close to or smaller than "
+                  f"--movetime ({movetime_s}s). This WILL cause false 'no response' aborts "
+                  f"on real moves, not actual engine crashes. Set --move-timeout to at least "
+                  f"{min_required}s.")
+
     e1_opts = parse_options(args.e1_options)
     e2_opts = parse_options(args.e2_options)
 
