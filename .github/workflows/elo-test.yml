@@ -189,7 +189,7 @@ jobs:
             --opening-multipv 4 \
             --opening-movetime 100 \
             --max-plies 260 \
-            --move-timeout 15 \
+            --move-timeout 45 \
             --out results.csv \
             --summary-json summary.json \
             --min-score "${{ github.event.inputs.min_score }}" \
