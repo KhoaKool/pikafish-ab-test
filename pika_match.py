@@ -607,6 +607,39 @@ def play_game(red_engine, black_engine, movetime_ms, max_plies, move_timeout_s,
     return "draw", max_plies, "max_plies_reached"
 
 
+def _write_results_csv(path, rows):
+    """Overwrites the results CSV with whatever rows exist so far. Called after
+    EVERY game (not just at the end) so that if the process gets killed
+    externally (CI job timeout, manual cancel, runner preemption), completed
+    games are never silently lost -- only the one game in flight at kill time is."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else
+                                 ["game", "pair_id", "e2_color", "result", "e2_result", "plies",
+                                  "reason", "seconds", "opening"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_summary_json(path, played, wins, draws, losses, aborted, final=False):
+    """Overwrites the machine-readable summary. Called after every game with
+    final=False (so a partial run still leaves a usable summary on disk if
+    killed) and once more at the very end with final=True (adds Elo/LOS)."""
+    if not path:
+        return
+    if played == 0:
+        data = {"played": 0, "wins": 0, "draws": 0, "losses": 0, "aborted": aborted,
+                "score": None, "elo": None, "elo_ci": None, "los": None}
+    else:
+        stats = fishtest_stats(wins, draws, losses)
+        data = {"played": played, "wins": wins, "draws": draws, "losses": losses,
+                "aborted": aborted, "score": stats["score"], "elo": stats["elo"],
+                "elo_ci": [stats["elo_lo"], stats["elo_hi"]], "los": stats["los"]}
+    if not final:
+        data["partial"] = True
+    with open(path, "w") as jf:
+        json.dump(data, jf, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine1", required=True, help="Path to baseline engine binary")
@@ -641,6 +674,13 @@ def main():
                           "qualifying ones into --obk-path.")
     ap.add_argument("--move-timeout", type=float, default=30.0,
                      help="Seconds to wait for a single bestmove before aborting the game")
+    ap.add_argument("--time-budget-s", type=float, default=0.0,
+                     help="Wall-clock ceiling for the WHOLE run (seconds). 0 = unlimited. "
+                          "When set, the harness stops starting new games once this elapses and "
+                          "exits cleanly (exit 0) with whatever games finished so far, instead of "
+                          "being hard-killed by an external timeout (e.g. CI job/runner limit) mid-game "
+                          "with zero results written. Set this comfortably below the external limit "
+                          "(e.g. runner hard cap minus ~15min) so the graceful stop always wins the race.")
     ap.add_argument("--e1-options", default="", help="e.g. Contempt=0,MaxThinkTime=30000")
     ap.add_argument("--e2-options", default="", help="e.g. Contempt=40,MaxThinkTime=30000")
     ap.add_argument("--out", default="pika_match_results.csv")
@@ -684,9 +724,16 @@ def main():
     consecutive_aborts = 0
     rows = []
     current_opening = []
+    run_start = time.time()
 
     try:
         for g in range(args.games):
+            if args.time_budget_s and (time.time() - run_start) >= args.time_budget_s:
+                print(f"\n[HẾT GIỜ] Đã dùng {args.time_budget_s:.0f}s time-budget sau {g} ván -- "
+                      f"dừng ở đây CÓ CHỦ ĐÍCH (không phải lỗi) để kết quả đã có được ghi lại "
+                      f"trọn vẹn, thay vì bị CI/runner kill giữa chừng mất hết dữ liệu.")
+                break
+
             e2_is_red = (g % 2 == 0)  # alternate who opens each game
             red, black = (e2, e1) if e2_is_red else (e1, e2)
 
@@ -735,18 +782,13 @@ def main():
                 aborted += 1
                 consecutive_aborts += 1
                 e2_result = "aborted"
-                if consecutive_aborts >= 3:
+                stop_now = consecutive_aborts >= 3
+                if stop_now:
                     print(f"\n[DỪNG SỚM] {consecutive_aborts} ván liên tiếp bị abort -- "
                           f"engine đang crash lặp lại, không phải sự cố ngẫu nhiên. "
                           f"Kiểm tra engine1_stderr.log / engine2_stderr.log để biết lý do thật.")
-                    rows.append({
-                        "game": g, "pair_id": g // 2, "e2_color": "red" if e2_is_red else "black",
-                        "result": result, "e2_result": e2_result,
-                        "plies": plies, "reason": reason, "seconds": round(dt, 1),
-                        "opening": " ".join(current_opening),
-                    })
-                    break
             else:
+                stop_now = False
                 consecutive_aborts = 0
                 if result == "draw":
                     draws += 1
@@ -767,20 +809,26 @@ def main():
                 "opening": " ".join(current_opening),
             })
 
+            # Write to disk after EVERY game, not just once at the end. If this
+            # process gets hard-killed (CI job timeout, manual cancel, runner
+            # preemption) mid-run, every game completed up to that point is
+            # already safely on disk -- only the one in-flight game is lost,
+            # instead of losing the entire run's worth of real Elo data.
+            _write_results_csv(args.out, rows)
             played = e2_wins + draws + e2_losses
+            _write_summary_json(args.summary_json, played, e2_wins, draws, e2_losses, aborted, final=False)
+
             score = (e2_wins + 0.5 * draws) / played if played else float("nan")
             print(f"[{g + 1}/{args.games}] e2={e2_result:8s} ({reason}, {plies}p, {dt:.0f}s) "
                   f"| hoàn tất: W{e2_wins} D{draws} L{e2_losses}  aborted={aborted}  score={score:.3f}")
+
+            if stop_now:
+                break
     finally:
         e1.quit()
         e2.quit()
 
-    with open(args.out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else
-                                 ["game", "pair_id", "e2_color", "result", "e2_result", "plies",
-                                  "reason", "seconds", "opening"])
-        writer.writeheader()
-        writer.writerows(rows)
+    _write_results_csv(args.out, rows)
 
     played = e2_wins + draws + e2_losses
     if played == 0:
@@ -792,10 +840,7 @@ def main():
             f"Xem artifact `engine1_stderr.log` / `engine2_stderr.log`, hoặc bước "
             f"\"Smoke test\" phía trên để biết engine nào crash và vì sao."
         )
-        if args.summary_json:
-            with open(args.summary_json, "w") as jf:
-                json.dump({"played": 0, "wins": 0, "draws": 0, "losses": 0, "aborted": aborted,
-                           "score": None, "elo_diff": None}, jf, indent=2)
+        _write_summary_json(args.summary_json, 0, 0, 0, 0, aborted, final=True)
         sys.exit(1)
 
     stats = fishtest_stats(e2_wins, draws, e2_losses)
@@ -834,10 +879,7 @@ def main():
     print("\nLƯU Ý: đọc phần THẬT THÀ VỀ GIỚI HẠN ở đầu file script trước khi kết luận.")
 
     if args.summary_json:
-        with open(args.summary_json, "w") as jf:
-            json.dump({"played": played, "wins": e2_wins, "draws": draws, "losses": e2_losses,
-                       "aborted": aborted, "score": score, "elo": stats["elo"],
-                       "elo_ci": [stats["elo_lo"], stats["elo_hi"]], "los": stats["los"]}, jf, indent=2)
+        _write_summary_json(args.summary_json, played, e2_wins, draws, e2_losses, aborted, final=True)
 
     if args.min_score is not None and score < args.min_score:
         print(f"\n[CI GATE] score {score:.3f} < --min-score {args.min_score:.3f} -> exit 1")

@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-BASE_COMMIT="8ab92480b3b270bb7271910585acd4cc148da80b"
+BASE_COMMIT="97133eebb6ed55e0bfa13262555c77d683d6ac0f"
 ARCH="${ARCH:-x86-64-bmi2}"
 COMP="${COMP:-mingw}"
 

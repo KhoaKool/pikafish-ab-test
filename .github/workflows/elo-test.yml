@@ -57,7 +57,7 @@ env:
 jobs:
   ab-test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 480
+    timeout-minutes: 355
     permissions:
       contents: write  # needed to commit the growing .obk book back to this repo
     steps:
@@ -190,6 +190,7 @@ jobs:
             --opening-movetime 100 \
             --max-plies 260 \
             --move-timeout 45 \
+            --time-budget-s 19800 \
             --out results.csv \
             --summary-json summary.json \
             --min-score "${{ github.event.inputs.min_score }}" \
@@ -207,7 +208,7 @@ jobs:
             --limit "${{ github.event.inputs.promote_candidates }}"
 
       - name: Commit updated book back to this repo
-        if: github.event.inputs.build_book == 'true'
+        if: always() && github.event.inputs.build_book == 'true'
         run: |
           git config user.name "pikafish-book-bot"
           git config user.email "actions@github.com"
@@ -230,4 +231,6 @@ jobs:
             summary.json
             engine1_stderr.log
             engine2_stderr.log
+            book/pikafish_book.obk
+            book/pikafish_book_candidates.obk
           if-no-files-found: ignore
