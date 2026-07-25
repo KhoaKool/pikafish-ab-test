@@ -31,9 +31,9 @@ on:
         required: false
         default: "true"
       promote_candidates:
-        description: "Số vị trí tối đa nâng cấp lên depth>=30 mỗi lần chạy (0 = bỏ qua bước này)"
+        description: "Số vị trí tối đa nâng cấp lên depth>=30 mỗi lần chạy (mỗi vị trí: chờ tới depth>=30 HOẶC tối đa 5 phút, tuỳ cái nào tới trước -- 0 = bỏ qua bước này)"
         required: false
-        default: "5"
+        default: "15"
 
 env:
   # Dùng đúng công thức build mà chính CI của official-pikafish/Pikafish đã
@@ -194,7 +194,7 @@ jobs:
             --opening-movetime 100 \
             --max-plies "${{ github.event.inputs.max_plies }}" \
             --move-timeout 45 \
-            --time-budget-s 19800 \
+            --time-budget-s 16200 \
             --out results.csv \
             --summary-json summary.json \
             --min-score "${{ github.event.inputs.min_score }}" \
